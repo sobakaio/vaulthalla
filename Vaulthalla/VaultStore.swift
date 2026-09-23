@@ -299,7 +299,8 @@ actor VaultStore {
     }
 
     func appendAudit(_ event: AuditEvent) async {
-        guard !fileManager.fileExists(atPath: auditRotationURL.path) else { return }
+        guard UserDefaults.standard.bool(forKey: "auditLoggingEnabled"),
+              !fileManager.fileExists(atPath: auditRotationURL.path) else { return }
         guard let header = try? loadHeader(),
               let audit = try? AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey) else { return }
         let maximumEntries = UserDefaults.standard.integer(forKey: "auditHistoryLimit")
@@ -309,6 +310,7 @@ actor VaultStore {
     }
 
     func setAuditHistoryLimit(_ limit: Int) throws {
+        guard UserDefaults.standard.bool(forKey: "auditLoggingEnabled") else { return }
         guard limit == 0 || [50, 100, 500].contains(limit) else { throw VaultError.storageFailure }
         guard !fileManager.fileExists(atPath: auditRotationURL.path) else { throw VaultError.storageFailure }
         let header = try loadHeader()
@@ -324,6 +326,25 @@ actor VaultStore {
         let header = try loadHeader()
         let audit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
         return try audit.decrypt(using: privateKey)
+    }
+
+    /// One-time crypto-shred of legacy audit history that could contain a
+    /// near-correct password or PIN. All old events are intentionally lost.
+    func purgeLegacyAuditSecrets(using rootKey: SymmetricKey) async throws {
+        try await completeAuditRotation(using: rootKey)
+        try await blockStore.load(using: rootKey)
+        if (await blockStore.snapshot()).auditPrivacyVersion != 1 {
+            try await eraseAudit(using: rootKey)
+            // Commit the marker only after the old audit key and log are rotated.
+            // If interrupted, the next unlock repeats the safe purge.
+            try await blockStore.markAuditPrivacyMigrated(using: rootKey)
+        }
+        // Turning logging off also removes history from newer versions. A
+        // failed/interrupted erasure is retried on the next authenticated unlock.
+        if !UserDefaults.standard.bool(forKey: "auditLoggingEnabled"),
+           fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("audit.log").path) {
+            try await eraseAudit(using: rootKey)
+        }
     }
 
     func eraseAudit(using rootKey: SymmetricKey) async throws {
@@ -352,8 +373,12 @@ actor VaultStore {
         values.isExcludedFromBackup = true
         try protectedURL.setResourceValues(values)
         let attributes = try fileManager.attributesOfItem(atPath: stagingURL.path)
-        guard attributes[.protectionKey] as? FileProtectionType == .complete,
-              try stagingURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
+        #if !targetEnvironment(simulator)
+        guard attributes[.protectionKey] as? FileProtectionType == .complete else {
+            throw VaultError.storageFailure
+        }
+        #endif
+        guard try stagingURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
             throw VaultError.storageFailure
         }
         let handle = try FileHandle(forWritingTo: stagingURL)
@@ -423,8 +448,12 @@ actor VaultStore {
         values.isExcludedFromBackup = true
         try protectedURL.setResourceValues(values)
         let attributes = try fileManager.attributesOfItem(atPath: temporaryURL.path)
-        guard attributes[.protectionKey] as? FileProtectionType == .completeUntilFirstUserAuthentication,
-              try temporaryURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
+        #if !targetEnvironment(simulator)
+        guard attributes[.protectionKey] as? FileProtectionType == .completeUntilFirstUserAuthentication else {
+            throw VaultError.storageFailure
+        }
+        #endif
+        guard try temporaryURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
             throw VaultError.storageFailure
         }
         let handle = try FileHandle(forWritingTo: temporaryURL)

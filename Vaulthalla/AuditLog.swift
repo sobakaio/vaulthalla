@@ -106,7 +106,12 @@ struct AuditLogStore {
     }
 
     func erase() throws {
-        try? FileManager.default.removeItem(at: logURL)
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            try FileManager.default.removeItem(at: logURL)
+        }
+        guard !FileManager.default.fileExists(atPath: logURL.path) else {
+            throw VaultError.storageFailure
+        }
     }
 
     private func loadEntries() throws -> [LockedAuditEntry] {

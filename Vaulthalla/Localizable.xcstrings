@@ -96,7 +96,7 @@
     "Copy address" : {
 
     },
-    "Counters reset after a successful unlock with the same method." : {
+    "Counters reset after a successful unlock with the same method. Security Activity is off by default; disabling it clears stored history. Entered secrets are never recorded." : {
 
     },
     "Create vault" : {
@@ -311,6 +311,9 @@
 
     },
     "Quick unlock is protected by the device security hardware. Your master password remains the recovery-free vault credential." : {
+
+    },
+    "Record Security Activity" : {
 
     },
     "Resume" : {

@@ -607,6 +607,17 @@ final class VaultAppModel {
             }
             return
         }
+        do {
+            try await store.purgeLegacyAuditSecrets(using: key)
+        } catch {
+            if sessionGeneration == generation {
+                rootKey = nil
+                records = []
+                phase = .locked
+                errorMessage = "Audit privacy cleanup failed. Unlock blocked."
+            }
+            return
+        }
         guard !destructionInProgress, rootKey != nil, sessionGeneration == generation,
               phase == initialPhase, isApplicationActive() else {
             if sessionGeneration == generation {
@@ -1229,6 +1240,17 @@ final class VaultAppModel {
         }
     }
 
+    func configureAuditLogging(_ enabled: Bool) async {
+        guard !enabled else { return }
+        auditEvents = []
+        guard let rootKey else { return } // Next unlock retries cleanup.
+        do {
+            try await store.eraseAudit(using: rootKey)
+        } catch {
+            errorMessage = "Security Activity cleanup failed. It will retry on unlock."
+        }
+    }
+
     func configureAuditHistoryLimit(_ limit: Int) async {
         do {
             try await store.setAuditHistoryLimit(limit)
@@ -1347,6 +1369,8 @@ final class VaultAppModel {
         guard !destructionInProgress else { return }
         destructionInProgress = true
         sessionGeneration &+= 1
+        // A new vault must not inherit an earlier vault's audit opt-in.
+        UserDefaults.standard.set(false, forKey: "auditLoggingEnabled")
         webImportServer.stop()
         WebImportBackgroundSession.shared.end()
         await store.revokeAccess()
@@ -3874,6 +3898,7 @@ struct SettingsView: View {
     @AppStorage("imageFillMode") private var imageFillMode = false
     @AppStorage("videoFillMode") private var videoFillMode = false
     @AppStorage("auditHistoryLimit") private var auditHistoryLimit = 0
+    @AppStorage("auditLoggingEnabled") private var auditLoggingEnabled = false
     @AppStorage("screenshotProtection") private var screenshotProtection = true
     @State private var showDestroyConfirmation = false
 
@@ -3952,10 +3977,15 @@ struct SettingsView: View {
                     LabeledContent("Password failures", value: "\(model.unlockStatistics.passwordFailures)")
                     LabeledContent("PIN failures", value: "\(model.unlockStatistics.pinFailures)")
                     LabeledContent("Face ID failures", value: "\(model.unlockStatistics.faceIDFailures)")
+                    Toggle("Record Security Activity", isOn: $auditLoggingEnabled)
+                        .onChange(of: auditLoggingEnabled) { _, enabled in
+                            Task { await model.configureAuditLogging(enabled) }
+                        }
                     Button("Security Activity", systemImage: "list.bullet.clipboard") {
                         showAuditActivity = true
                         Task { await model.loadAuditEvents() }
                     }
+                    .disabled(!auditLoggingEnabled)
                     Picker("History", selection: $auditHistoryLimit) {
                         Text("Unlimited").tag(0)
                         Text("50 entries").tag(50)
@@ -3965,10 +3995,11 @@ struct SettingsView: View {
                     .onChange(of: auditHistoryLimit) { _, limit in
                         Task { await model.configureAuditHistoryLimit(limit) }
                     }
+                    .disabled(!auditLoggingEnabled)
                 } header: {
                     Text("Unlock statistics")
                 } footer: {
-                    Text("Counters reset after a successful unlock with the same method.")
+                    Text("Counters reset after a successful unlock with the same method. Security Activity is off by default; disabling it clears stored history. Entered secrets are never recorded.")
                 }
 
                 Section {

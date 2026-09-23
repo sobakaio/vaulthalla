@@ -21,6 +21,8 @@ struct MediaRecord: Codable, Identifiable, Hashable {
 struct VaultIndex: Codable {
     var records: [UUID: MediaRecord] = [:]
     var auditPrivateKey: Data?
+    /// Nil in legacy indexes that may have stored failed unlock input.
+    var auditPrivacyVersion: Int? = nil
     var freeChunks: Set<ChunkAddress> = []
     var nextSlotBySegment: [Int: Int] = [:]
     var lastVerifiedAt: Date?

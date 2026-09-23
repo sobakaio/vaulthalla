@@ -38,6 +38,7 @@ actor EncryptedBlockStore {
         guard !fileManager.fileExists(atPath: indexURL.path) else { throw VaultError.vaultAlreadyExists }
         index = VaultIndex()
         index.auditPrivateKey = auditPrivateKey
+        index.auditPrivacyVersion = 1
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         try save(using: rootKey)
     }
@@ -560,6 +561,11 @@ actor EncryptedBlockStore {
 
     func replaceAuditPrivateKey(_ privateKey: Data, using rootKey: SymmetricKey) throws {
         index.auditPrivateKey = privateKey
+        try save(using: rootKey)
+    }
+
+    func markAuditPrivacyMigrated(using rootKey: SymmetricKey) throws {
+        index.auditPrivacyVersion = 1
         try save(using: rootKey)
     }
 
