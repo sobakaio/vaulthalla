@@ -47,7 +47,7 @@ actor AttemptStateStore {
         self.account = account
     }
 
-    enum PersistenceError: Error { case keychain(OSStatus), invalidData, readbackMismatch, destructionRequired }
+    enum PersistenceError: Error { case keychain(OSStatus), invalidData, readbackMismatch, destructionRequired, convenienceLockedOut }
 
     private var query: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -103,6 +103,8 @@ actor AttemptStateStore {
     func recordSuccessChecked(method: UnlockMethod) throws -> AttemptState {
         var state = try loadChecked()
         guard !AttemptPolicy.shouldDestroy(state: state) else { throw PersistenceError.destructionRequired }
+        if method == .pin, state.pinFailures >= state.pinThreshold { throw PersistenceError.convenienceLockedOut }
+        if method == .faceID, state.faceIDFailures >= state.faceIDThreshold { throw PersistenceError.convenienceLockedOut }
         switch method {
         case .password:
             state.passwordFailures = 0

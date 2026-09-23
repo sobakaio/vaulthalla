@@ -47,6 +47,42 @@ struct SecurityPolicyTests {
         await store.erase()
     }
 
+    @Test(.serialized) @MainActor func persistedLockoutsRejectStaleConvenienceWrappers() async throws {
+        let attempts = AttemptStateStore(account: "lockout-test-\(UUID().uuidString)")
+        var state = AttemptState()
+        state.pinFailures = state.pinThreshold
+        state.faceIDFailures = state.faceIDThreshold
+        try await attempts.saveChecked(state)
+        await #expect(throws: AttemptStateStore.PersistenceError.self) {
+            try await attempts.recordSuccessChecked(method: .pin)
+        }
+        await #expect(throws: AttemptStateStore.PersistenceError.self) {
+            try await attempts.recordSuccessChecked(method: .faceID)
+        }
+        #expect(try await attempts.loadChecked() == state)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = VaultAppModel()
+        model.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        model.attemptStore = attempts
+        model.phase = .locked
+        model.pinEnabled = true // Simulate a stale Keychain wrapper after failed deletion.
+        model.faceIDEnabled = true
+        model.pendingPIN = "1234"
+        await model.unlockWithPIN()
+        #expect(!model.pinEnabled)
+        #expect(model.pendingPIN.isEmpty)
+        #expect(model.phase == .locked)
+        await model.unlockWithFaceID()
+        #expect(!model.faceIDEnabled)
+        #expect(model.phase == .locked)
+        model.pinEnabled = true
+        model.faceIDEnabled = true
+        await model.loadSecuritySettings()
+        #expect(!model.pinEnabled && !model.faceIDEnabled)
+        await attempts.erase()
+    }
+
     @Test(.serialized) @MainActor func attemptStoreAndFaceIDStateMachine() async {
         let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
 

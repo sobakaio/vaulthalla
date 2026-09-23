@@ -1137,6 +1137,12 @@ final class VaultAppModel {
         guard await requireDeviceBinding() else { return }
         guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
         if AttemptPolicy.shouldDestroy(state: state) { await completeAutoDestroy(); return }
+        guard state.pinFailures < state.pinThreshold else {
+            pinEnabled = false
+            pendingPIN = ""
+            errorMessage = "PIN disabled after too many failed attempts."
+            return
+        }
         let delay = AttemptPolicy.delay(for: state.pinFailures)
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         do {
@@ -1177,6 +1183,11 @@ final class VaultAppModel {
         guard await requireDeviceBinding() else { return }
         guard let persistedState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
         if AttemptPolicy.shouldDestroy(state: persistedState) { await completeAutoDestroy(); return }
+        guard persistedState.faceIDFailures < persistedState.faceIDThreshold else {
+            faceIDEnabled = false
+            errorMessage = "Face ID disabled after too many failed attempts."
+            return
+        }
         isBusy = true
         defer { isBusy = false }
         do {
@@ -1213,6 +1224,8 @@ final class VaultAppModel {
         autoDestroyThreshold = state.autoDestroyThreshold
         pinFailureThreshold = state.pinThreshold
         faceIDFailureThreshold = state.faceIDThreshold
+        if state.pinFailures >= state.pinThreshold { pinEnabled = false }
+        if state.faceIDFailures >= state.faceIDThreshold { faceIDEnabled = false }
     }
 
     func loadAuditEvents() async {

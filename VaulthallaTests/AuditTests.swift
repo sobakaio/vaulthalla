@@ -120,6 +120,24 @@ struct AuditTests {
         #expect((try await store.loadHeader()).auditPublicKey == newHeader.auditPublicKey)
     }
 
+    #if !targetEnvironment(simulator)
+    @Test func auditReplacementKeepsCompleteProtectionOnDevice() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        let store = try AuditLogStore(rootDirectory: directory, publicKeyData: privateKey.publicKey.rawRepresentation)
+        for index in 0..<2 {
+            try store.append(AuditEvent(timestamp: Date(), method: .lifecycle,
+                                        result: "event-\(index)", enteredSecret: nil))
+            let log = directory.appendingPathComponent("audit.log")
+            let attributes = try FileManager.default.attributesOfItem(atPath: log.path)
+            #expect(attributes[.protectionKey] as? FileProtectionType == .complete)
+            #expect(try log.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+            #expect(!FileManager.default.fileExists(atPath: log.appendingPathExtension("tmp").path))
+        }
+    }
+    #endif
+
     @Test func wrongAuditPrivateKeyCannotDecrypt() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
