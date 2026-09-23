@@ -4,6 +4,29 @@ import CryptoKit
 @testable import Vaulthalla
 
 struct AuditTests {
+    @Test func auditMetadataNeverIncludesFailedUnlockInput() throws {
+        let event = AuditEvent(timestamp: Date(timeIntervalSince1970: 1),
+                               method: .password, result: "failure", enteredSecret: "near-correct-secret")
+        let sanitized = event.metadataOnly
+        #expect(sanitized.enteredSecret == nil)
+        #expect(sanitized.method == .password)
+        #expect(sanitized.result == "failure")
+        #expect(try JSONEncoder().encode(sanitized).range(of: Data("near-correct-secret".utf8)) == nil)
+    }
+
+    @Test @MainActor func lockClearsDecryptedAuditEntries() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = VaultAppModel()
+        model.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        model.phase = .unlocked
+        model.auditEvents = [AuditEvent(timestamp: Date(), method: .password,
+                                        result: "failure", enteredSecret: "legacy-guess")]
+        model.lock()
+        #expect(model.phase == .locked)
+        #expect(model.auditEvents.isEmpty)
+    }
+
     @Test func lockedAuditEntryDecryptsOnlyWithPrivateKey() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -14,7 +37,7 @@ struct AuditTests {
 
         let raw = try Data(contentsOf: directory.appendingPathComponent("audit.log"))
         #expect(raw.range(of: Data(secret.utf8)) == nil)
-        #expect(try store.decrypt(using: privateKey.rawRepresentation).first?.enteredSecret == secret)
+        #expect(try store.decrypt(using: privateKey.rawRepresentation).first?.enteredSecret == nil)
     }
 
     @Test func wrongAuditPrivateKeyCannotDecrypt() throws {

@@ -461,7 +461,6 @@ final class VaultAppModel {
                 errorMessage = "Unlock unavailable. Security state preserved."
                 return
             }
-            let failedInput = pendingPassword
             guard let state = try? await attemptStore.recordFailureChecked(method: .password) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = state
             pendingPassword = ""
@@ -469,7 +468,7 @@ final class VaultAppModel {
                 await completeAutoDestroy()
                 destructionMessage = "Vault destroyed after \(state.autoDestroyThreshold) failed unlock attempts."
             } else {
-                await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "failure", enteredSecret: failedInput))
+                await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "failure", enteredSecret: nil))
                 errorMessage = "Incorrect password or unavailable device binding."
             }
         }
@@ -1140,10 +1139,9 @@ final class VaultAppModel {
             await finishUnlock(using: unlockedKey)
         } catch {
             guard canFinishUnlock(generation) else { return }
-            let failedInput = pendingPIN
             guard let next = try? await attemptStore.recordFailureChecked(method: .pin) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = next
-            await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "failure", enteredSecret: failedInput))
+            await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "failure", enteredSecret: nil))
             pendingPIN = ""
             if next.pinFailures >= next.pinThreshold {
                 ConvenienceUnlockStore.removeAll()
@@ -1207,11 +1205,16 @@ final class VaultAppModel {
     }
 
     func loadAuditEvents() async {
-        guard let rootKey else { return }
+        guard let rootKey, phase == .unlocked else { return }
+        let generation = sessionGeneration
         do {
-            // The journal is append-only on disk; show newest entries on top.
-            auditEvents = Array((try await store.readAudit(using: rootKey)).reversed())
+            let events = try await store.readAudit(using: rootKey)
+            // A lock may occur while decryption is suspended. Never repopulate
+            // the model after that transition, and never retain legacy inputs.
+            guard sessionGeneration == generation, phase == .unlocked, self.rootKey != nil else { return }
+            auditEvents = events.reversed().map(\.metadataOnly)
         } catch {
+            guard sessionGeneration == generation, phase == .unlocked else { return }
             errorMessage = "Security Activity is unavailable."
         }
     }
@@ -1325,6 +1328,7 @@ final class VaultAppModel {
         }
         rootKey = nil
         records = []
+        auditEvents = []
         generatedPreviewIDs.removeAll()
         // An onboarding flow has no vault to protect. Keep it visible when the
         // app is backgrounded or privacy protection is triggered before the
@@ -1350,6 +1354,7 @@ final class VaultAppModel {
         await BackgroundOperationCoordinator.shared.cancelAndDrain()
         rootKey = nil
         records = []
+        auditEvents = []
         generatedPreviewIDs.removeAll()
         // A restart must finish cleanup even if deletion was interrupted.
         UserDefaults.standard.set(true, forKey: "vaultDestructionPending")

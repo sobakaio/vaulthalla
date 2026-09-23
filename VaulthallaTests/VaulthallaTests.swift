@@ -4,6 +4,21 @@ import CryptoKit
 @testable import Vaulthalla
 
 struct VaulthallaTests {
+    #if !VAULTHALLA_UNSAFE_HTTP_IMPORT
+    @Test @MainActor func defaultBuildRefusesPlaintextWebImport() {
+        let server = LocalWebImportServer()
+        server.start(rootKey: SymmetricKey(size: .bits256))
+        guard case .failed = server.state else {
+            Issue.record("Plaintext Web Import listener must be disabled by default")
+            server.stop()
+            return
+        }
+        #expect(server.importURL == nil)
+        #expect(server.pairingPIN.isEmpty)
+        server.stop()
+    }
+    #endif
+
     @Test func passwordKeyIsDeterministicForSameInputs() throws {
         let salt = Data(repeating: 7, count: 32)
         let first = try PasswordKDF.deriveKey(password: "correct horse battery", salt: salt, iterations: 100_000)

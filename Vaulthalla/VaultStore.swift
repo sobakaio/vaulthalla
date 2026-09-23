@@ -303,7 +303,9 @@ actor VaultStore {
         guard let header = try? loadHeader(),
               let audit = try? AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey) else { return }
         let maximumEntries = UserDefaults.standard.integer(forKey: "auditHistoryLimit")
-        try? audit.append(event, maximumEntries: maximumEntries > 0 ? maximumEntries : nil)
+        // Never persist user-entered unlock input, even if a future caller
+        // accidentally supplies it. Legacy entries are handled separately.
+        try? audit.append(event.metadataOnly, maximumEntries: maximumEntries > 0 ? maximumEntries : nil)
     }
 
     func setAuditHistoryLimit(_ limit: Int) throws {

@@ -13,6 +13,10 @@ struct AuditEvent: Codable, Equatable {
     let method: AuditMethod
     let result: String
     let enteredSecret: String?
+
+    var metadataOnly: AuditEvent {
+        AuditEvent(timestamp: timestamp, method: method, result: result, enteredSecret: nil)
+    }
 }
 
 struct LockedAuditEntry: Codable {
@@ -42,7 +46,8 @@ struct AuditLogStore {
             sharedInfo: Data("Vaulthalla-audit-entry-v1".utf8),
             outputByteCount: 32
         )
-        let plaintext = try JSONEncoder().encode(event)
+        // Audit metadata must never retain unlock input, even for direct callers.
+        let plaintext = try JSONEncoder().encode(event.metadataOnly)
         let sealed = try AES.GCM.seal(plaintext, using: key)
         let ciphertext = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
         var entries = try loadEntries()

@@ -54,10 +54,11 @@ final class LocalWebImportServer {
     private var previousIdleTimerState: Bool?
 
     func start(rootKey: SymmetricKey) {
-        #if !DEBUG
-        // The HTTP pairing PIN does not authenticate the transport. Keep the
-        // listener unavailable in release builds until browser-verifiable TLS
-        // or an authenticated pairing protocol is implemented and tested.
+        #if !DEBUG || !VAULTHALLA_UNSAFE_HTTP_IMPORT
+        // Plain HTTP exposes the PIN, token and media to an active LAN attacker.
+        // Keep it off in every normal build. An explicit development-only Swift
+        // flag may enable the insecure listener for controlled testing; it must
+        // never be enabled for distribution or treated as a security feature.
         state = .failed("Web Import is unavailable until secure transport is supported.")
         return
         #else
