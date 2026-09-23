@@ -47,6 +47,13 @@ struct WebImportView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
+                                Text("Pairing PIN: \(server.pairingPIN)")
+                                    .font(.title2.monospacedDigit().bold())
+                                    .textSelection(.enabled)
+                                Text("Enter this PIN in the browser. Eight wrong attempts lock pairing until you restart Web Import. Use only a trusted Wi-Fi network: HTTP cannot protect against someone intercepting or changing traffic.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
                                 Button(copied ? "Copied" : "Copy address", systemImage: copied ? "checkmark" : "doc.on.doc") {
                                     UIPasteboard.general.string = url.absoluteString
                                     copied = true
@@ -70,7 +77,7 @@ struct WebImportView: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Label("One-way and local only", systemImage: "lock.shield.fill")
                                 .font(.headline)
-                            Text("Files travel directly to this iPhone over your local network. They are encrypted as they arrive. This page cannot view, download, or browse anything already in your vault.")
+                            Text("Files travel directly to this iPhone over your local network and are encrypted as they arrive. This page cannot browse your vault. The network transfer itself is not encrypted.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                             Divider()

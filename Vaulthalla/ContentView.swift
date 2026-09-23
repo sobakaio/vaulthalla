@@ -8,6 +8,7 @@ import UIKit
 import LocalAuthentication
 import AVKit
 import OSLog
+import Security
 import UserNotifications
 
 struct ContentView: View {
@@ -140,6 +141,45 @@ final class VaultAppModel {
     var faceIDUnlocker: any FaceIDUnlocking = LiveFaceIDUnlocker()
     let webImportServer = LocalWebImportServer()
     private var loaded = false
+    private var sessionGeneration: UInt64 = 0
+    private var destructionInProgress = false
+    var isApplicationActive: () -> Bool = { UIApplication.shared.applicationState == .active }
+
+    /// A missing device binding for an existing vault is not a bad password.
+    /// Other Keychain errors may be temporary, so they block access without wiping.
+    private func requireDeviceBinding() async -> Bool {
+        // Test models and a normal first launch can have no committed vault.
+        // Never erase global Keychain state from an unrelated empty store.
+        let hasHeader = await store.hasVault()
+        let hasJournal = await store.hasPendingCreation()
+        if !hasHeader && !hasJournal { return true }
+        do {
+            _ = try KeychainStore.loadDeviceSecret()
+            return true
+        } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
+            // Recheck before irreversible cleanup in case a transient Keychain
+            // visibility change produced an apparent missing item.
+            do {
+                _ = try KeychainStore.loadDeviceSecret()
+                return true
+            } catch VaultError.keychainFailure(let retry) where retry == errSecItemNotFound {
+                await completeAutoDestroy()
+                destructionMessage = "Vault destroyed because its device key was lost."
+                return false
+            } catch {
+                errorMessage = "Device key unavailable. Unlock blocked."
+                return false
+            }
+        } catch {
+            errorMessage = "Device key unavailable. Unlock blocked."
+            return false
+        }
+    }
+
+    private func canFinishUnlock(_ generation: UInt64) -> Bool {
+        sessionGeneration == generation && phase == .locked &&
+        isApplicationActive() && !Task.isCancelled && !destructionInProgress
+    }
     private var generatedPreviewIDs = Set<UUID>()
 
     /// §20 — free space on the volume holding the vault, in bytes.
@@ -208,11 +248,25 @@ final class VaultAppModel {
         var deleteOriginals: Bool
     }
 
-    private func savePendingPhotoImport(_ identifiers: [String], deleteOriginals: Bool) {
+    @discardableResult
+    private func savePendingPhotoImport(_ identifiers: [String], deleteOriginals: Bool) -> Bool {
+        guard let rootKey else { return false }
         let url = Self.pendingImportURL
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try? JSONEncoder().encode(PendingImport(identifiers: identifiers, deleteOriginals: deleteOriginals))
-        try? data?.write(to: url, options: .atomic)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let plaintext = try JSONEncoder().encode(PendingImport(identifiers: identifiers, deleteOriginals: deleteOriginals))
+            let sealed = try AES.GCM.seal(plaintext, using: rootKey, authenticating: Data("Vaulthalla-pending-import-v1".utf8))
+            let data = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+            var protectedURL = url
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try protectedURL.setResourceValues(values)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func clearPendingPhotoImport() {
@@ -220,22 +274,27 @@ final class VaultAppModel {
     }
 
     private func loadPendingPhotoImport() -> PendingImport? {
-        guard let data = try? Data(contentsOf: Self.pendingImportURL) else { return nil }
-        return try? JSONDecoder().decode(PendingImport.self, from: data)
+        guard let rootKey, let data = try? Data(contentsOf: Self.pendingImportURL) else { return nil }
+        if let legacy = try? JSONDecoder().decode(PendingImport.self, from: data) {
+            // Migrate a pending import written by an older release before using it.
+            guard savePendingPhotoImport(legacy.identifiers, deleteOriginals: legacy.deleteOriginals) else { return nil }
+            return legacy
+        }
+        guard data.count >= 28,
+              let nonce = try? AES.GCM.Nonce(data: data.prefix(12)),
+              let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: data.dropFirst(12).dropLast(16), tag: data.suffix(16)),
+              let plaintext = try? AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-pending-import-v1".utf8)) else { return nil }
+        return try? JSONDecoder().decode(PendingImport.self, from: plaintext)
     }
 
     /// Re-imports photo items whose import was interrupted (app suspended or
     /// killed mid-import). Called after a successful unlock: no silent losses.
     func resumePendingPhotoImport() async {
         guard let pending = loadPendingPhotoImport(), !pending.identifiers.isEmpty, let rootKey else { return }
-        savePendingPhotoImport([], deleteOriginals: pending.deleteOriginals)  // claim before fetch
         let options = PHFetchOptions()
         options.predicate = NSPredicate(format: "localIdentifier IN %@", pending.identifiers)
         let result = PHAsset.fetchAssets(with: options)
-        guard result.count > 0 else {
-            clearPendingPhotoImport()
-            return
-        }
+        guard result.count > 0 else { return }
         isBusy = true
         defer { isBusy = false }
         importProgress = ImportProgress()
@@ -283,13 +342,48 @@ final class VaultAppModel {
         guard !loaded else { return }
         loaded = true
         let hasVault = await store.hasVault()
-        if !hasVault {
-            // Fresh-install hygiene (§7): remove stale device secret, attempt counters and
-            // convenience wrappers so a reinstalled app cannot show a leftover PIN button
-            // or inflated failure counters.
-            KeychainStore.deleteAllVaulthallaItems()
+        if UserDefaults.standard.bool(forKey: "vaultDestructionPending") {
+            phase = .locked
+            await completeAutoDestroy()
+            return
         }
         phase = hasVault ? .locked : .onboarding
+        if hasVault {
+            guard await requireDeviceBinding() else { return }
+        } else {
+            let pendingCreation = await store.hasPendingCreation()
+            if await store.hasCommittedIndex() {
+                phase = .locked
+                await completeAutoDestroy()
+                destructionMessage = "Vault destroyed because its header and index did not match."
+                return
+            }
+            if pendingCreation {
+                // A staged creation is consistent only while its device key exists.
+                guard await requireDeviceBinding() else { return }
+            } else {
+                do {
+                    _ = try KeychainStore.loadDeviceSecret()
+                    phase = .locked
+                    await completeAutoDestroy()
+                    destructionMessage = "Vault destroyed because its header was lost."
+                    return
+                } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
+                    // No committed vault or device binding: ordinary first launch.
+                } catch {
+                    phase = .locked
+                    errorMessage = "Device key unavailable. Vault setup blocked."
+                    return
+                }
+            }
+        }
+        if hasVault, let state = try? await attemptStore.loadChecked(), AttemptPolicy.shouldDestroy(state: state) {
+            await completeAutoDestroy()
+            return
+        }
+        if hasVault {
+            guard (try? await attemptStore.loadChecked()) != nil else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        }
         pinEnabled = ConvenienceUnlockStore.hasPIN()
         faceIDEnabled = ConvenienceUnlockStore.hasFaceID()
         await loadSecuritySettings()
@@ -337,33 +431,45 @@ final class VaultAppModel {
         }
         isBusy = true
         defer { isBusy = false }
-        let currentState = await attemptStore.load()
+        let generation = sessionGeneration
+        guard await requireDeviceBinding() else { return }
+        guard let currentState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        if AttemptPolicy.shouldDestroy(state: currentState) {
+            await completeAutoDestroy()
+            return
+        }
         let delay = AttemptPolicy.delay(for: currentState.passwordFailures)
         if delay > 0 {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
         do {
             let unlockedKey = try await store.unlock(password: pendingPassword)
-            unlockStatistics = await attemptStore.recordSuccess(method: .password)
+            guard canFinishUnlock(generation) else { return }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .password) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "success", enteredSecret: nil))
             pendingPassword = ""
+            guard canFinishUnlock(generation) else { return }
             await finishUnlock(using: unlockedKey)
         } catch {
+            guard canFinishUnlock(generation) else { return }
+            if case VaultError.keychainFailure(errSecItemNotFound) = error {
+                _ = await requireDeviceBinding()
+                return
+            }
+            guard (error as? VaultError) == .invalidPasswordOrDevice else {
+                errorMessage = "Unlock unavailable. Security state preserved."
+                return
+            }
             let failedInput = pendingPassword
-            let state = await attemptStore.recordFailure(method: .password)
+            guard let state = try? await attemptStore.recordFailureChecked(method: .password) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = state
-            await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "failure", enteredSecret: failedInput))
             pendingPassword = ""
             if AttemptPolicy.shouldDestroy(state: state) {
-                // Auto-destroy wipes everything: convenience wrappers, failure
-                // counters, keys and vault files. A recreated vault starts fresh.
-                ConvenienceUnlockStore.removeAll()
-                await attemptStore.erase()
-                await store.destroyVault()
-                resetUnlockState()
-                phase = .onboarding
+                await completeAutoDestroy()
                 destructionMessage = "Vault destroyed after \(state.autoDestroyThreshold) failed unlock attempts."
             } else {
+                await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "failure", enteredSecret: failedInput))
                 errorMessage = "Incorrect password or unavailable device binding."
             }
         }
@@ -474,6 +580,14 @@ final class VaultAppModel {
             integrityState = index.integrityState
             lastVerifiedAt = index.lastVerifiedAt
             return true
+        } catch VaultError.authenticatedIndexMismatch, VaultError.missingCommittedIndex {
+            if await store.hasVault() {
+                await completeAutoDestroy()
+                destructionMessage = "Vault destroyed after authenticated data or key mismatch."
+            } else {
+                errorMessage = "Vault Integrity Error"
+            }
+            return false
         } catch {
             errorMessage = "Vault Integrity Error"
             return false
@@ -482,11 +596,24 @@ final class VaultAppModel {
 
     /// Keep the lock screen visible until the encrypted index is authenticated and ready.
     private func finishUnlock(using key: SymmetricKey) async {
+        guard await requireDeviceBinding() else { return }
+        let generation = sessionGeneration
+        let initialPhase = phase
         rootKey = key
         guard await refreshIndex() else {
-            rootKey = nil
-            records = []
-            phase = .locked
+            if phase != .onboarding {
+                rootKey = nil
+                records = []
+                phase = .locked
+            }
+            return
+        }
+        guard !destructionInProgress, rootKey != nil, sessionGeneration == generation,
+              phase == initialPhase, isApplicationActive() else {
+            if sessionGeneration == generation {
+                rootKey = nil
+                records = []
+            }
             return
         }
         phase = .unlocked
@@ -626,7 +753,10 @@ final class VaultAppModel {
         // Persist the pending list so an import interrupted by app suspension
         // or a kill resumes automatically after the next unlock.
         var pendingIdentifiers = items.compactMap { $0.itemIdentifier }
-        savePendingPhotoImport(pendingIdentifiers, deleteOriginals: deleteOriginals)
+        guard savePendingPhotoImport(pendingIdentifiers, deleteOriginals: deleteOriginals) else {
+            importMessage = "Could not securely save the pending import. No photos were imported or deleted."
+            return
+        }
 
         for (index, item) in items.enumerated() {
             do {
@@ -694,7 +824,7 @@ final class VaultAppModel {
         if cancelled {
             importMessage = "Import cancelled."
         } else {
-            clearPendingPhotoImport()
+            if pendingIdentifiers.isEmpty { clearPendingPhotoImport() }
             var message = "Photos: imported \(imported), duplicates skipped \(duplicates), failed \(failed)."
             if deleteOriginals {
                 message += " \(deletedOriginals) original(s) deleted."
@@ -993,18 +1123,25 @@ final class VaultAppModel {
         guard pinEnabled else { return }
         isBusy = true
         defer { isBusy = false }
-        let state = await attemptStore.load()
+        let generation = sessionGeneration
+        guard await requireDeviceBinding() else { return }
+        guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        if AttemptPolicy.shouldDestroy(state: state) { await completeAutoDestroy(); return }
         let delay = AttemptPolicy.delay(for: state.pinFailures)
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         do {
             let unlockedKey = try ConvenienceUnlockStore.unlockWithPIN(pendingPIN)
-            unlockStatistics = await attemptStore.recordSuccess(method: .pin)
+            guard canFinishUnlock(generation) else { return }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .pin) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "success", enteredSecret: nil))
             pendingPIN = ""
+            guard canFinishUnlock(generation) else { return }
             await finishUnlock(using: unlockedKey)
         } catch {
+            guard canFinishUnlock(generation) else { return }
             let failedInput = pendingPIN
-            let next = await attemptStore.recordFailure(method: .pin)
+            guard let next = try? await attemptStore.recordFailureChecked(method: .pin) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = next
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "failure", enteredSecret: failedInput))
             pendingPIN = ""
@@ -1027,15 +1164,23 @@ final class VaultAppModel {
             return
         }
         guard faceIDEnabled else { return }
+        let generation = sessionGeneration
+        guard await requireDeviceBinding() else { return }
+        guard let persistedState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        if AttemptPolicy.shouldDestroy(state: persistedState) { await completeAutoDestroy(); return }
         isBusy = true
         defer { isBusy = false }
         do {
             let unlockedKey = try await faceIDUnlocker.unlock()
-            unlockStatistics = await attemptStore.recordSuccess(method: .faceID)
+            guard canFinishUnlock(generation) else { return }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .faceID) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "success", enteredSecret: nil))
+            guard canFinishUnlock(generation) else { return }
             await finishUnlock(using: unlockedKey)
         } catch is FaceIDAuthenticationFailure {
-            let next = await attemptStore.recordFailure(method: .faceID)
+            guard canFinishUnlock(generation) else { return }
+            guard let next = try? await attemptStore.recordFailureChecked(method: .faceID) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = next
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "failure", enteredSecret: nil))
             if next.faceIDFailures >= next.faceIDThreshold {
@@ -1047,12 +1192,13 @@ final class VaultAppModel {
                 errorMessage = "Face ID authentication failed."
             }
         } catch {
+            guard canFinishUnlock(generation) else { return }
             errorMessage = "Face ID is unavailable."
         }
     }
 
     func loadSecuritySettings() async {
-        let state = await attemptStore.load()
+        guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
         unlockStatistics = state
         autoDestroyEnabled = state.autoDestroyEnabled
         autoDestroyThreshold = state.autoDestroyThreshold
@@ -1093,10 +1239,10 @@ final class VaultAppModel {
 
     func configureAutoDestroy(enabled: Bool? = nil, threshold: Int? = nil) {
         Task {
-            let state = await attemptStore.configure { state in
+            guard let state = try? await attemptStore.configureChecked({ state in
                 if let enabled { state.autoDestroyEnabled = enabled }
                 if let threshold { state.autoDestroyThreshold = threshold }
-            }
+            }) else { errorMessage = "Security settings could not be saved."; return }
             autoDestroyEnabled = state.autoDestroyEnabled
             autoDestroyThreshold = state.autoDestroyThreshold
             unlockStatistics = state
@@ -1108,10 +1254,10 @@ final class VaultAppModel {
 
     func configureConvenienceThresholds(pin: Int? = nil, faceID: Int? = nil) {
         Task {
-            let state = await attemptStore.configure { state in
+            guard let state = try? await attemptStore.configureChecked({ state in
                 if let pin { state.pinThreshold = pin }
                 if let faceID { state.faceIDThreshold = faceID }
-            }
+            }) else { errorMessage = "Security settings could not be saved."; return }
             pinFailureThreshold = state.pinThreshold
             faceIDFailureThreshold = state.faceIDThreshold
         }
@@ -1170,7 +1316,13 @@ final class VaultAppModel {
     }
 
     func lock(reason: String? = nil) {
+        sessionGeneration &+= 1
+        BackgroundOperationCoordinator.shared.cancelCurrentOperation()
         webImportServer.stop()
+        Task {
+            await store.revokeAccess()
+            await webImportServer.stopAndDrain()
+        }
         rootKey = nil
         records = []
         generatedPreviewIDs.removeAll()
@@ -1187,19 +1339,38 @@ final class VaultAppModel {
         }
     }
 
-    func destroyVault() async {
+    private func completeAutoDestroy() async {
+        guard !destructionInProgress else { return }
+        destructionInProgress = true
+        sessionGeneration &+= 1
         webImportServer.stop()
+        WebImportBackgroundSession.shared.end()
+        await store.revokeAccess()
+        await webImportServer.stopAndDrain()
+        await BackgroundOperationCoordinator.shared.cancelAndDrain()
         rootKey = nil
         records = []
         generatedPreviewIDs.removeAll()
-        // A destroyed vault leaves nothing behind: convenience wrappers,
-        // failure counters, audit view state and in-memory settings are all
-        // wiped so a new vault cannot inherit stale Face ID / PIN state.
-        ConvenienceUnlockStore.removeAll()
-        await attemptStore.erase()
-        await store.destroyVault()
+        // A restart must finish cleanup even if deletion was interrupted.
+        UserDefaults.standard.set(true, forKey: "vaultDestructionPending")
+        do {
+            try await store.destroyVault()
+            // Verify removal of all remaining wrappers and attempt state before
+            // clearing the resumable destruction marker.
+            try KeychainStore.deleteAllVaulthallaItems()
+        } catch {
+            errorMessage = "Vault destruction failed. Cleanup must be retried."
+            destructionInProgress = false
+            return
+        }
+        UserDefaults.standard.removeObject(forKey: "vaultDestructionPending")
         resetUnlockState()
         phase = .onboarding
+        destructionInProgress = false
+    }
+
+    func destroyVault() async {
+        await completeAutoDestroy()
     }
 
     /// Resets every in-memory unlock setting after a vault is destroyed.

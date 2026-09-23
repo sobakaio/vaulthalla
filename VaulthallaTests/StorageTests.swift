@@ -1,9 +1,102 @@
 import Testing
 import Foundation
 import CryptoKit
+import Security
 @testable import Vaulthalla
 
 struct StorageTests {
+    #if targetEnvironment(simulator)
+    @Test func creationJournalRecoversAfterRestartWithoutReplacingIndex() async throws {
+        let manager = FileManager.default
+        let appSupport = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let root = appSupport.appendingPathComponent("Vaulthalla")
+        guard !manager.fileExists(atPath: root.appendingPathComponent("vault.header").path),
+              !manager.fileExists(atPath: root.appendingPathComponent("index.v1").path) else {
+            Issue.record("Simulator already has a vault; refusing to alter it")
+            return
+        }
+        do {
+            _ = try KeychainStore.loadDeviceSecret()
+            Issue.record("Simulator already has a device secret; refusing to alter it")
+            return
+        } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {}
+        defer {
+            try? manager.removeItem(at: root)
+            try? KeychainStore.deleteDeviceSecret()
+        }
+        let password = "long-creation-test-password"
+        let initial = VaultStore(fileManager: manager)
+        try await initial.createVault(password: password, segmentCapacity: .megabytes50, stopAfterStaging: true)
+        #expect(!(await initial.hasVault()))
+        let deviceBinding = try KeychainStore.loadDeviceSecret()
+        let restarted = VaultStore(fileManager: manager)
+        let model = await MainActor.run { VaultAppModel() }
+        await MainActor.run { model.store = restarted }
+        await model.load()
+        #expect(try KeychainStore.loadDeviceSecret() == deviceBinding)
+        await #expect(throws: VaultError.invalidPasswordOrDevice) {
+            try await restarted.resumeCreation(password: "incorrect-password")
+        }
+        #expect(!(await restarted.hasVault()))
+        // An unrelated pre-existing index must never be replaced by recovery.
+        let rogue = EncryptedBlockStore(rootDirectory: root)
+        try await rogue.initialize(using: SymmetricKey(size: .bits256), auditPrivateKey: Curve25519.KeyAgreement.PrivateKey().rawRepresentation)
+        let indexURL = root.appendingPathComponent("index.v1")
+        let rogueBytes = try Data(contentsOf: indexURL)
+        await #expect(throws: (any Error).self) {
+            try await restarted.resumeCreation(password: password)
+        }
+        #expect(try Data(contentsOf: indexURL) == rogueBytes)
+        try manager.removeItem(at: indexURL)
+        try await restarted.resumeCreation(password: password)
+        #expect(await restarted.hasVault())
+        let key = try await restarted.unlock(password: password)
+        try await restarted.loadIndex(using: key)
+        #expect(!manager.fileExists(atPath: root.appendingPathComponent("vault.creation").path))
+        // A committed index without its header is inconsistent: destroy it.
+        let headerURL = root.appendingPathComponent("vault.header")
+        try manager.removeItem(at: headerURL)
+        let orphanModel = await MainActor.run { VaultAppModel() }
+        await MainActor.run { orphanModel.store = VaultStore(fileManager: manager) }
+        await orphanModel.load()
+        #expect(!manager.fileExists(atPath: root.path))
+        await #expect(throws: VaultError.keychainFailure(errSecItemNotFound)) {
+            try KeychainStore.loadDeviceSecret()
+        }
+
+        // A verified missing device key for an existing header also wipes it.
+        let missingKeyStore = VaultStore(fileManager: manager)
+        try await missingKeyStore.createVault(password: password, segmentCapacity: .megabytes50)
+        try KeychainStore.deleteDeviceSecret()
+        let missingKeyModel = await MainActor.run { VaultAppModel() }
+        await MainActor.run { missingKeyModel.store = missingKeyStore }
+        await missingKeyModel.load()
+        #expect(!manager.fileExists(atPath: root.path))
+        #expect(!UserDefaults.standard.bool(forKey: "vaultDestructionPending"))
+        await #expect(throws: VaultError.keychainFailure(errSecItemNotFound)) {
+            try KeychainStore.loadDeviceSecret()
+        }
+
+        // Wrong password alone must not wipe a sound vault. An authenticated
+        // index-tag mismatch after a correct password must wipe it.
+        let fresh = VaultStore(fileManager: manager)
+        try await fresh.createVault(password: password, segmentCapacity: .megabytes50)
+        let integrityModel = await MainActor.run { VaultAppModel() }
+        await MainActor.run { integrityModel.store = fresh }
+        await integrityModel.load()
+        await MainActor.run { integrityModel.pendingPassword = "wrong-password" }
+        await integrityModel.unlock()
+        #expect(manager.fileExists(atPath: headerURL.path))
+        var tampered = try Data(contentsOf: indexURL)
+        tampered[tampered.index(before: tampered.endIndex)] ^= 1
+        try tampered.write(to: indexURL)
+        await MainActor.run { integrityModel.pendingPassword = password }
+        await integrityModel.unlock()
+        #expect(!manager.fileExists(atPath: root.path))
+        #expect(!UserDefaults.standard.bool(forKey: "vaultDestructionPending"))
+    }
+    #endif
+
     @Test func encryptedImportRoundTripsExactBytes() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }

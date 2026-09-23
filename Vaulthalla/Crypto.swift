@@ -11,6 +11,8 @@ enum VaultError: LocalizedError, Equatable {
     case invalidHeader
     case invalidPasswordOrDevice
     case integrityFailure
+    case authenticatedIndexMismatch
+    case missingCommittedIndex
     case keychainFailure(OSStatus)
     case storageFailure
     case unsupportedFormat
@@ -25,6 +27,8 @@ enum VaultError: LocalizedError, Equatable {
         case .invalidHeader: return "Vault header is invalid."
         case .invalidPasswordOrDevice: return "Incorrect password or unavailable device binding."
         case .integrityFailure: return "Vault integrity could not be verified."
+        case .authenticatedIndexMismatch: return "Authenticated vault data does not match its key."
+        case .missingCommittedIndex: return "The committed vault index was lost."
         case .keychainFailure: return "Secure key storage is unavailable."
         case .storageFailure: return "Vault storage is unavailable."
         case .unsupportedFormat: return "This vault format is not supported."
@@ -163,10 +167,10 @@ enum KeychainStore {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecAttrSynchronizable as String: false
         ]
-        SecItemDelete(query as CFDictionary)
-        guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
-            throw VaultError.keychainFailure(errSecIO)
-        }
+        // Creation must never replace another vault's device binding.
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw VaultError.keychainFailure(status) }
+        guard try loadDeviceSecret() == data else { throw VaultError.integrityFailure }
     }
 
     static func loadDeviceSecret() throws -> Data {
@@ -185,23 +189,39 @@ enum KeychainStore {
         return data
     }
 
-    static func deleteDeviceSecret() {
+    static func deleteDeviceSecret() throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw VaultError.keychainFailure(status)
+        }
+        var result: CFTypeRef?
+        let verification = SecItemCopyMatching(query as CFDictionary, &result)
+        guard verification == errSecItemNotFound else {
+            throw VaultError.keychainFailure(verification)
+        }
     }
 
     /// Fresh-install hygiene: removes every Vaulthalla keychain item (device secret,
     /// attempt counters, PIN/Face ID wrappers) so a reinstalled app starts clean.
-    static func deleteAllVaulthallaItems() {
+    static func deleteAllVaulthallaItems() throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw VaultError.keychainFailure(status)
+        }
+        var result: CFTypeRef?
+        let verification = SecItemCopyMatching(query as CFDictionary, &result)
+        guard verification == errSecItemNotFound else {
+            throw VaultError.keychainFailure(verification)
+        }
     }
 }
 

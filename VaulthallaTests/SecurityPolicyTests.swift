@@ -28,8 +28,27 @@ struct SecurityPolicyTests {
         #expect(state.destructivePasswordFailures == 0)
     }
 
+    @Test(.serialized) func checkedAttemptStatePersistsAndDoesNotDeleteBeforeUpdate() async throws {
+        let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
+        await store.erase()
+        var state = AttemptState()
+        state.autoDestroyEnabled = true
+        state.autoDestroyThreshold = 2
+        try await store.saveChecked(state)
+        let first = try await store.recordFailureChecked(method: .password)
+        #expect(first.destructivePasswordFailures == 1)
+        let terminal = try await store.recordFailureChecked(method: .password)
+        #expect(AttemptPolicy.shouldDestroy(state: terminal))
+        #expect(try await store.loadChecked() == terminal)
+        await #expect(throws: AttemptStateStore.PersistenceError.self) {
+            try await store.recordSuccessChecked(method: .password)
+        }
+        #expect(try await store.loadChecked() == terminal)
+        await store.erase()
+    }
+
     @Test(.serialized) @MainActor func attemptStoreAndFaceIDStateMachine() async {
-        let store = AttemptStateStore.shared
+        let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
 
         // Part 1 — counters persist across loads.
         await store.erase()
@@ -48,6 +67,9 @@ struct SecurityPolicyTests {
         await store.erase()
         let model = VaultAppModel()
         model.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        model.attemptStore = store
+        model.phase = .locked
+        model.isApplicationActive = { true }
         model.faceIDEnabled = true
         model.faceIDUnlocker = ScriptedFaceIDUnlocker(results: [
             .failure(FaceIDAuthenticationFailure()),
@@ -68,17 +90,21 @@ struct SecurityPolicyTests {
         #expect(!model.faceIDEnabled)
         #expect(model.errorMessage.contains("disabled"))
 
-        // Part 3 — a successful biometric unlock restores access.
+        // Part 3 — a valid biometric result clears its counter, but a missing
+        // vault index must not expose the unlocked UI.
         await store.erase()
         let successModel = VaultAppModel()
         successModel.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        successModel.attemptStore = store
+        successModel.phase = .locked
+        successModel.isApplicationActive = { true }
         successModel.faceIDEnabled = true
         successModel.faceIDUnlocker = ScriptedFaceIDUnlocker(results: [
             .success(SymmetricKey(size: .bits256))
         ])
         await successModel.unlockWithFaceID()
-        #expect(successModel.phase == .unlocked)
-        #expect(successModel.rootKey != nil)
+        #expect(successModel.phase == .locked)
+        #expect(successModel.rootKey == nil)
         #expect((await store.load()).faceIDFailures == 0)
 
         await store.erase()

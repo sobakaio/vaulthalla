@@ -4,18 +4,38 @@ import CryptoKit
 actor EncryptedBlockStore {
     let rootDirectory: URL
     private let fileManager: FileManager
+    enum CompactionBoundary: CaseIterable {
+        case write, sync, replace, cleanup
+    }
+    private let compactionFault: ((CompactionBoundary) throws -> Void)?
     private(set) var index = VaultIndex()
+    private var accessGeneration: UInt64 = 0
+    private var accessRevoked = false
+
+    func revokeAccess() {
+        accessGeneration &+= 1
+        accessRevoked = true
+    }
+
+    func activateAccess() {
+        accessGeneration &+= 1
+        accessRevoked = false
+    }
 
     private var indexURL: URL { rootDirectory.appendingPathComponent("index.v1") }
     private var segmentURLPrefix: String { "segment-" }
     private var slotSize: Int { VaultConstants.chunkPayloadSize + 12 + 16 }
 
-    init(rootDirectory: URL, fileManager: FileManager = .default) {
+    init(rootDirectory: URL, fileManager: FileManager = .default,
+         compactionFault: ((CompactionBoundary) throws -> Void)? = nil) {
         self.rootDirectory = rootDirectory
         self.fileManager = fileManager
+        self.compactionFault = compactionFault
     }
 
     func initialize(using rootKey: SymmetricKey, auditPrivateKey: Data) throws {
+        activateAccess()
+        guard !fileManager.fileExists(atPath: indexURL.path) else { throw VaultError.vaultAlreadyExists }
         index = VaultIndex()
         index.auditPrivateKey = auditPrivateKey
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
@@ -23,26 +43,43 @@ actor EncryptedBlockStore {
     }
 
     func load(using rootKey: SymmetricKey) throws {
-        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        guard !accessRevoked else { throw CancellationError() }
         guard let data = fileManager.contents(atPath: indexURL.path) else {
-            index = VaultIndex()
-            return
+            // A missing committed index is distinct from a temporarily unreadable
+            // Data Protection or filesystem item.
+            if !fileManager.fileExists(atPath: indexURL.path) {
+                throw VaultError.missingCommittedIndex
+            }
+            throw VaultError.integrityFailure
         }
-        guard data.count >= 28 else { throw VaultError.integrityFailure }
+        guard data.count >= 28 else { throw VaultError.authenticatedIndexMismatch }
         let nonce = try AES.GCM.Nonce(data: data.prefix(12))
         let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: data.dropFirst(12).dropLast(16), tag: data.suffix(16))
-        let plaintext = try AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-index-v1".utf8))
+        let plaintext: Data
+        do {
+            plaintext = try AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-index-v1".utf8))
+        } catch CryptoKitError.authenticationFailure {
+            throw VaultError.authenticatedIndexMismatch
+        }
         index = try JSONDecoder().decode(VaultIndex.self, from: plaintext)
-        try validateIndex()
+        do {
+            try validateIndex()
+        } catch VaultError.integrityFailure {
+            throw VaultError.authenticatedIndexMismatch
+        }
     }
 
     func save(using rootKey: SymmetricKey) throws {
+        guard !accessRevoked else { throw CancellationError() }
         let plaintext = try JSONEncoder().encode(index)
         let sealed = try AES.GCM.seal(plaintext, using: rootKey, authenticating: Data("Vaulthalla-index-v1".utf8))
         let data = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
         let temporary = indexURL.appendingPathExtension("tmp")
         try data.write(to: temporary, options: .atomic)
-        try excludeFromBackup(temporary)
+        try protectAndExclude(temporary)
+        let temporaryHandle = try FileHandle(forWritingTo: temporary)
+        try temporaryHandle.synchronize()
+        try temporaryHandle.close()
         if fileManager.fileExists(atPath: indexURL.path) {
             _ = try fileManager.replaceItemAt(indexURL, withItemAt: temporary)
         } else {
@@ -51,20 +88,23 @@ actor EncryptedBlockStore {
     }
 
     func appendEncryptedChunk(_ encryptedChunk: Data, address: ChunkAddress) throws {
+        guard !accessRevoked else { throw CancellationError() }
         guard encryptedChunk.count == slotSize else { throw VaultError.storageFailure }
         let url = segmentURL(for: address.segment)
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         if !fileManager.fileExists(atPath: url.path) {
-            fileManager.createFile(atPath: url.path, contents: nil)
-            try excludeFromBackup(url)
+            guard fileManager.createFile(atPath: url.path, contents: nil, attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication.rawValue]) else { throw VaultError.storageFailure }
+            try protectAndExclude(url)
         }
         let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
         try handle.seek(toOffset: UInt64(address.slot * slotSize))
         try handle.write(contentsOf: encryptedChunk)
+        try handle.synchronize()
     }
 
     func readEncryptedChunk(at address: ChunkAddress) throws -> Data {
+        guard !accessRevoked else { throw CancellationError() }
         let url = segmentURL(for: address.segment)
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -79,6 +119,7 @@ actor EncryptedBlockStore {
     }
 
     func importFile(at sourceURL: URL, filename: String, mimeType: String, rootKey: SymmetricKey, segmentCapacity: Int) throws -> MediaRecord? {
+        guard !accessRevoked else { throw CancellationError() }
         let handle = try FileHandle(forReadingFrom: sourceURL)
         defer { try? handle.close() }
 
@@ -138,6 +179,8 @@ actor EncryptedBlockStore {
         rootKey: SymmetricKey,
         segmentCapacity: Int
     ) async throws -> MediaRecord? {
+        guard !accessRevoked else { throw CancellationError() }
+        let generation = accessGeneration
         let itemID = UUID()
         let mediaKey = VaultCrypto.randomData(count: 32)
         var addresses: [ChunkAddress] = []
@@ -148,6 +191,7 @@ actor EncryptedBlockStore {
 
         do {
             for try await sourceChunk in stream {
+                guard !accessRevoked, generation == accessGeneration else { throw CancellationError() }
                 try Task.checkCancellation()
                 pending.append(sourceChunk)
                 while pending.count >= VaultConstants.chunkPayloadSize {
@@ -187,11 +231,14 @@ actor EncryptedBlockStore {
             for address in addresses {
                 index.freeChunks.insert(address)
             }
-            try? validateIndex()
-            try? save(using: rootKey)
+            if !accessRevoked, generation == accessGeneration {
+                try? validateIndex()
+                try? save(using: rootKey)
+            }
             throw error
         }
 
+        guard !accessRevoked, generation == accessGeneration else { throw CancellationError() }
         let hash = Data(digest.finalize())
         if let duplicate = index.records.values.first(where: { $0.sha256 == hash }) {
             _ = try plaintext(for: duplicate)
@@ -229,6 +276,7 @@ actor EncryptedBlockStore {
         rootKey: SymmetricKey,
         segmentCapacity: Int
     ) throws {
+        guard !accessRevoked else { throw CancellationError() }
         digest.update(data: sourceChunk)
         totalBytes += Int64(sourceChunk.count)
         var padded = sourceChunk
@@ -276,6 +324,7 @@ actor EncryptedBlockStore {
     /// without buffering an entire large media item in memory. The caller must
     /// remove the file as soon as it has finished deriving its preview.
     func writePlaintext(for record: MediaRecord, to url: URL) throws {
+        guard !accessRevoked else { throw CancellationError() }
         guard record.byteCount >= 0,
               !fileManager.fileExists(atPath: url.path),
               fileManager.createFile(
@@ -411,131 +460,65 @@ actor EncryptedBlockStore {
         return (index.records.count, corrupt)
     }
 
+    /// Copy-on-write compaction: old slots remain untouched until the replacement
+    /// index is committed. A failed copy leaves unreferenced new segments only.
     func compact(using rootKey: SymmetricKey, segmentCapacity: Int = VaultConstants.defaultSegmentCapacity) async throws -> Int {
-        let slotsPerSegment = max(1, segmentCapacity / slotSize)
-        var locations: [RelocationRef: ChunkAddress] = [:]
-        var referencesByAddress: [ChunkAddress: RelocationRef] = [:]
-        var references: [RelocationRef] = []
-
-        for record in index.records.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            for (ordinal, address) in record.chunks.enumerated() {
-                let reference = RelocationRef(recordID: record.id, ordinal: ordinal)
-                references.append(reference)
-                locations[reference] = address
-                referencesByAddress[address] = reference
-            }
-        }
-
-        references.sort {
-            let lhs = locations[$0]!
-            let rhs = locations[$1]!
-            return lhs.segment == rhs.segment ? lhs.slot < rhs.slot : lhs.segment < rhs.segment
-        }
-
-        let segmentURLs = try fileManager.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: [.fileSizeKey])
+        let oldIndex = index
+        let oldSegments = try fileManager.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix(segmentURLPrefix) && $0.pathExtension == "dat" }
-
-        var freeAddresses = index.freeChunks
-        for url in segmentURLs {
-            guard let segment = Int(url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: segmentURLPrefix, with: "")),
-                  let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { continue }
-            let slotCount = fileSize / slotSize
-            for slot in 0..<slotCount {
-                let address = ChunkAddress(segment: segment, slot: slot)
-                if referencesByAddress[address] == nil {
-                    freeAddresses.insert(address)
-                }
-            }
-        }
-
+        let highest = oldSegments.compactMap { Int($0.deletingPathExtension().lastPathComponent.dropFirst(segmentURLPrefix.count)) }.max() ?? -1
+        let slotsPerSegment = max(1, segmentCapacity / slotSize)
+        let startSegment = max(highest, oldIndex.nextSlotBySegment.keys.max() ?? -1) + 1
+        var replacement = oldIndex
+        replacement.freeChunks = []
+        replacement.nextSlotBySegment = [:]
         var moved = 0
-        for (targetIndex, reference) in references.enumerated() {
-            try Task.checkCancellation()
-            let target = ChunkAddress(segment: targetIndex / slotsPerSegment, slot: targetIndex % slotsPerSegment)
-
-            while locations[reference] != target {
-                guard let source = locations[reference] else { throw VaultError.integrityFailure }
-
-                if let occupant = referencesByAddress[target], occupant != reference {
-                    guard let scratch = freeAddresses.first(where: { $0 != target }) else {
-                        throw VaultError.storageFailure
-                    }
-                    try relocateChunk(occupant, from: target, to: scratch)
-                    locations[occupant] = scratch
-                    referencesByAddress.removeValue(forKey: target)
-                    referencesByAddress[scratch] = occupant
-                    freeAddresses.remove(scratch)
-                    freeAddresses.insert(target)
+        do {
+            for id in oldIndex.records.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+                guard var record = oldIndex.records[id] else { throw VaultError.integrityFailure }
+                for ordinal in record.chunks.indices {
+                    try Task.checkCancellation()
+                    let source = record.chunks[ordinal]
+                    let destination = ChunkAddress(segment: startSegment + moved / slotsPerSegment, slot: moved % slotsPerSegment)
+                    let physical = try readEncryptedChunk(at: source)
+                    let nonce = try AES.GCM.Nonce(data: physical.prefix(12))
+                    let chunkKey = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: record.mediaKey), salt: Data("Vaulthalla-media-salt-v1".utf8), info: Data("item:\(id.uuidString)|chunk:\(ordinal)|format:1".utf8), outputByteCount: 32)
+                    let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: physical.dropFirst(12).dropLast(16), tag: physical.suffix(16))
+                    let clear = try AES.GCM.open(box, using: chunkKey, authenticating: Data("Vaulthalla-chunk-v1|\(source.segment)|\(source.slot)".utf8))
+                    let sealed = try AES.GCM.seal(clear, using: chunkKey, nonce: nonce, authenticating: Data("Vaulthalla-chunk-v1|\(destination.segment)|\(destination.slot)".utf8))
+                    try compactionFault?(.write)
+                    try appendEncryptedChunk(nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag, address: destination)
+                    record.chunks[ordinal] = destination
+                    replacement.nextSlotBySegment[destination.segment] = destination.slot + 1
                     moved += 1
                 }
-
-                try relocateChunk(reference, from: source, to: target)
-                locations[reference] = target
-                referencesByAddress.removeValue(forKey: source)
-                referencesByAddress[target] = reference
-                freeAddresses.remove(target)
-                freeAddresses.insert(source)
-                moved += 1
+                replacement.records[id] = record
             }
+            for segment in replacement.nextSlotBySegment.keys {
+                try compactionFault?(.sync)
+                let handle = try FileHandle(forWritingTo: segmentURL(for: segment))
+                try handle.synchronize()
+                try handle.close()
+            }
+            index = replacement
+            try validateIndex()
+            try compactionFault?(.replace)
+            try save(using: rootKey)
+        } catch {
+            // The index rename may have succeeded before a later error.
+            // Reconcile actor state with the durable index before returning.
+            if (try? load(using: rootKey)) == nil { index = oldIndex }
+            throw error
         }
-
-        index.freeChunks = freeAddresses
-        let usedSegments = Set(referencesByAddress.keys.map(\.segment))
-        var removed = 0
-        for url in segmentURLs {
-            guard let segment = Int(url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: segmentURLPrefix, with: "")),
-                  !usedSegments.contains(segment) else { continue }
-            try fileManager.removeItem(at: url)
-            index.nextSlotBySegment.removeValue(forKey: segment)
-            index.freeChunks = index.freeChunks.filter { $0.segment != segment }
-            removed += 1
+        // Cleanup is best effort after commit: old slots remain harmless orphans
+        // if interrupted, and the next compaction can remove them.
+        for url in oldSegments {
+            do {
+                try compactionFault?(.cleanup)
+                try fileManager.removeItem(at: url)
+            } catch { /* A committed index must remain usable after cleanup fails. */ }
         }
-
-        var nextSlots: [Int: Int] = [:]
-        for address in referencesByAddress.keys {
-            nextSlots[address.segment] = max(nextSlots[address.segment] ?? 0, address.slot + 1)
-        }
-        index.nextSlotBySegment = nextSlots
-        try validateIndex()
-        try save(using: rootKey)
-        return moved + removed
-    }
-
-    private struct RelocationRef: Hashable {
-        let recordID: UUID
-        let ordinal: Int
-    }
-
-    private func relocateChunk(_ reference: RelocationRef, from source: ChunkAddress, to destination: ChunkAddress) throws {
-        guard source != destination,
-              let record = index.records[reference.recordID],
-              reference.ordinal < record.chunks.count else { return }
-
-        let physical = try readEncryptedChunk(at: source)
-        let nonce = try AES.GCM.Nonce(data: physical.prefix(12))
-        let chunkKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: record.mediaKey),
-            salt: Data("Vaulthalla-media-salt-v1".utf8),
-            info: Data("item:\(record.id.uuidString)|chunk:\(reference.ordinal)|format:1".utf8),
-            outputByteCount: 32
-        )
-        let recordedAddress = record.chunks[reference.ordinal]
-        guard recordedAddress == source else { throw VaultError.integrityFailure }
-        let oldAAD = Data("Vaulthalla-chunk-v1|\(recordedAddress.segment)|\(recordedAddress.slot)".utf8)
-        let box = try AES.GCM.SealedBox(
-            nonce: nonce,
-            ciphertext: physical.dropFirst(12).dropLast(16),
-            tag: physical.suffix(16)
-        )
-        let clear = try AES.GCM.open(box, using: chunkKey, authenticating: oldAAD)
-        let newAAD = Data("Vaulthalla-chunk-v1|\(destination.segment)|\(destination.slot)".utf8)
-        let sealed = try AES.GCM.seal(clear, using: chunkKey, nonce: nonce, authenticating: newAAD)
-        let rewritten = nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
-        try appendEncryptedChunk(rewritten, address: destination)
-
-        var updated = record
-        updated.chunks[reference.ordinal] = destination
-        index.records[reference.recordID] = updated
+        return moved + oldSegments.count
     }
 
     func delete(_ id: UUID, rootKey: SymmetricKey) throws {
@@ -597,6 +580,11 @@ actor EncryptedBlockStore {
     func segmentCount() -> Int {
         let urls = (try? fileManager.contentsOfDirectory(at: rootDirectory, includingPropertiesForKeys: nil)) ?? []
         return urls.filter { $0.lastPathComponent.hasPrefix(segmentURLPrefix) && $0.pathExtension == "dat" }.count
+    }
+
+    func protectAndExclude(_ url: URL) throws {
+        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+        try excludeFromBackup(url)
     }
 
     func excludeFromBackup(_ url: URL) throws {

@@ -29,7 +29,7 @@ final class VaulthallaUITests: XCTestCase {
 
         let passwordField = app.secureTextFields["masterPasswordField"]
         let createPasswordField = app.secureTextFields["createPasswordField"]
-        let imagesTab = app.tabBars.buttons["Images"]
+        let imagesTab = app.buttons["Images"]
         let pinUnlock = app.buttons["Unlock with PIN"]
         let faceIDUnlock = app.buttons["Unlock with Face ID"]
         let welcomeBack = app.staticTexts["Welcome back"]
@@ -120,14 +120,14 @@ final class VisualSmokeTests: XCTestCase {
 
         // 3a. Each library screen can be reached with a horizontal swipe;
         // vertical scrolling and the explicit tab bar remain available.
-        let videosTab = app.tabBars.buttons["Videos"]
-        let settingsTab = app.tabBars.buttons["Settings"]
+        let videosTab = app.buttons["Videos"]
+        let settingsTab = app.buttons["Settings"]
         swipe(app, fromX: 0.82, fromY: 0.50, toX: 0.18, toY: 0.50)
         XCTAssertTrue(videosTab.isSelected, "A left swipe should open Videos")
         swipe(app, fromX: 0.82, fromY: 0.50, toX: 0.18, toY: 0.50)
         XCTAssertTrue(settingsTab.isSelected, "A second left swipe should open Settings")
-        app.tabBars.buttons["Images"].tap()
-        XCTAssertTrue(app.tabBars.buttons["Images"].isSelected, "The bottom bar should still switch screens")
+        app.buttons["Images"].tap()
+        XCTAssertTrue(app.buttons["Images"].isSelected, "The bottom bar should still switch screens")
 
         // 4. Open the ellipsis menu -> Import sheet.
         app.buttons["moreMenuButton"].tap()
@@ -300,7 +300,7 @@ final class VisualSmokeTests: XCTestCase {
 
         // 14. Open the imported video and verify its poster, ordered controls,
         //     scrubber placement, and mute state change.
-        app.tabBars.buttons["Videos"].tap()
+        app.buttons["Videos"].tap()
         let videoGroupQuery = app.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier BEGINSWITH 'group-'"))
         XCTAssertTrue(videoGroupQuery.firstMatch.waitForExistence(timeout: 15), "Video preview group missing")
@@ -352,7 +352,7 @@ final class VisualSmokeTests: XCTestCase {
         // XCTest's tap waits for the app to become idle, so the brief progress
         // view may finish before the test can query it. The screen recording
         // verifies the progress UI; this assertion verifies the full unlock.
-        XCTAssertTrue(app.tabBars.buttons["Images"].waitForExistence(timeout: 15), "Library should appear after successful unlock")
+        XCTAssertTrue(app.buttons["Images"].waitForExistence(timeout: 15), "Library should appear after successful unlock")
     }
 
 }

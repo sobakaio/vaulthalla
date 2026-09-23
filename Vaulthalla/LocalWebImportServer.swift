@@ -30,6 +30,7 @@ final class LocalWebImportServer {
     static let maximumUploadBytes: Int64 = 20 * 1024 * 1024 * 1024
 
     var state: State = .stopped
+    var pairingPIN = ""
     var importURL: URL?
     var activeFilename = ""
     var uploadedCount = 0
@@ -42,18 +43,31 @@ final class LocalWebImportServer {
     private let store = VaultStore.shared
     private var listener: NWListener?
     private var token = ""
+    private var failedPairings = 0
+    private static let maximumPairingAttempts = 8
     private var rootKey: SymmetricKey?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var expiryTask: Task<Void, Never>?
+    private var importTasks: [UUID: Task<MediaRecord?, Error>] = [:]
+    private var importStreams: [UUID: AsyncThrowingStream<Data, Error>.Continuation] = [:]
     private var usingPreferredPort = false
     private var previousIdleTimerState: Bool?
 
     func start(rootKey: SymmetricKey) {
+        #if !DEBUG
+        // The HTTP pairing PIN does not authenticate the transport. Keep the
+        // listener unavailable in release builds until browser-verifiable TLS
+        // or an authenticated pairing protocol is implemented and tested.
+        state = .failed("Web Import is unavailable until secure transport is supported.")
+        return
+        #else
         stop()
         previousIdleTimerState = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
         self.rootKey = rootKey
         token = Self.makeToken()
+        pairingPIN = String(format: "%08d", Int.random(in: 0..<100_000_000))
+        failedPairings = 0
         state = .starting
         uploadedCount = 0
         activeFilename = ""
@@ -74,7 +88,9 @@ final class LocalWebImportServer {
             state = .failed("Could not start the local server.")
             self.rootKey = nil
             token = ""
+            pairingPIN = ""
         }
+        #endif
     }
 
     private func installListener(on port: NWEndpoint.Port) throws {
@@ -106,13 +122,23 @@ final class LocalWebImportServer {
         listener = nil
         connections.values.forEach { $0.cancel() }
         connections.removeAll()
+        importStreams.values.forEach { $0.finish(throwing: CancellationError()) }
+        importTasks.values.forEach { $0.cancel() }
         rootKey = nil
         token = ""
+        pairingPIN = ""
+        failedPairings = 0
         importURL = nil
         expiresAt = nil
         activeFilename = ""
         onImportCompleted = nil
         state = .stopped
+    }
+
+    func stopAndDrain() async {
+        stop()
+        let tasks = Array(importTasks.values)
+        for task in tasks { _ = try? await task.value }
     }
 
     private func handle(_ listenerState: NWListener.State) {
@@ -204,6 +230,40 @@ final class LocalWebImportServer {
                     return
                 }
 
+                if request.method == "POST", request.path == "/pair" {
+                    guard request.headers["transfer-encoding"] == nil,
+                          let rawLength = request.headers["content-length"],
+                          let length = Int(rawLength), length == 8,
+                          bodyPrefix.count <= length else {
+                        self.respond(connection, status: 400, body: #"{"error":"Invalid pairing request."}"#)
+                        return
+                    }
+                    Task { @MainActor in
+                        var body = bodyPrefix
+                        while body.count < length {
+                            guard let next = await self.receiveNext(connection), !next.isEmpty,
+                                  body.count + next.count <= length else {
+                                self.fail(connection)
+                                return
+                            }
+                            body.append(next)
+                        }
+                        guard self.failedPairings < Self.maximumPairingAttempts else {
+                            self.respond(connection, status: 429, body: #"{"error":"Too many attempts. Restart Web Import for a new PIN."}"#)
+                            return
+                        }
+                        guard let candidate = String(data: body, encoding: .ascii),
+                              candidate.count == 8, candidate.allSatisfy(\.isNumber),
+                              candidate == self.pairingPIN else {
+                            self.failedPairings += 1
+                            self.respond(connection, status: 403, body: #"{"error":"Wrong PIN. Check the iPhone screen."}"#)
+                            return
+                        }
+                        self.respond(connection, status: 200, body: WebImportPage.html(token: self.token), contentType: "text/html; charset=utf-8")
+                    }
+                    return
+                }
+
                 guard request.method == "POST",
                       request.path == "/import/\(self.token)/upload",
                       request.headers["transfer-encoding"] == nil,
@@ -235,12 +295,25 @@ final class LocalWebImportServer {
         }
 
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        let importID = UUID()
         let importTask = Task {
             try await store.importStream(stream, filename: filename, mimeType: mimeType, rootKey: importRootKey)
         }
+        importTasks[importID] = importTask
+        importStreams[importID] = continuation
 
         Task { @MainActor [weak self] in
             guard let self else { return }
+            defer {
+                self.importTasks.removeValue(forKey: importID)
+                self.importStreams.removeValue(forKey: importID)
+            }
+            guard self.state == .running else {
+                continuation.finish(throwing: CancellationError())
+                importTask.cancel()
+                _ = try? await importTask.value
+                return
+            }
             self.activeFilename = filename
             var received = Int64(0)
             let initial = Data(prefix.prefix(Int(min(Int64(prefix.count), expectedLength))))
@@ -303,15 +376,15 @@ final class LocalWebImportServer {
     }
 
     private func servePage(_ connection: NWConnection, path: String) {
-        guard path == "/" || path == "/import/\(token)/" else {
+        guard path == "/" else {
             respond(connection, status: 404, body: #"{"error":"Not found."}"#)
             return
         }
-        respond(connection, status: 200, body: WebImportPage.html(token: token), contentType: "text/html; charset=utf-8")
+        respond(connection, status: 200, body: WebImportPage.pairingHTML, contentType: "text/html; charset=utf-8")
     }
 
     private func respond(_ connection: NWConnection, status: Int, body: String, contentType: String = "application/json; charset=utf-8") {
-        let reason = status == 200 ? "OK" : status == 201 ? "Created" : status == 400 ? "Bad Request" : status == 404 ? "Not Found" : status == 422 ? "Unprocessable Content" : status == 423 ? "Locked" : status == 431 ? "Request Header Fields Too Large" : status == 499 ? "Client Closed Request" : "Internal Server Error"
+        let reason = status == 200 ? "OK" : status == 201 ? "Created" : status == 400 ? "Bad Request" : status == 403 ? "Forbidden" : status == 429 ? "Too Many Requests" : status == 404 ? "Not Found" : status == 422 ? "Unprocessable Content" : status == 423 ? "Locked" : status == 431 ? "Request Header Fields Too Large" : status == 499 ? "Client Closed Request" : "Internal Server Error"
         let bodyData = Data(body.utf8)
         let header = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(bodyData.count)\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n"
         connection.send(content: Data(header.utf8) + bodyData, completion: .contentProcessed { [weak self] _ in
@@ -395,6 +468,14 @@ final class LocalWebImportServer {
 }
 
 enum WebImportPage {
+    static let pairingHTML = """
+    <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Vaulthalla pairing</title><style>body{font:16px -apple-system,sans-serif;max-width:380px;margin:15vh auto;padding:24px;color:#eee;background:#111}input,button{box-sizing:border-box;width:100%;padding:14px;font:inherit;margin:8px 0;border-radius:10px}input{background:#222;color:white;border:1px solid #666}button{background:#2997ff;color:white;border:0}p{line-height:1.5}</style>
+    <h1>Pair with Vaulthalla</h1><p>Enter the 8-digit PIN shown on your iPhone. Only pair on a Wi-Fi network you trust.</p>
+    <form id="pair"><input id="pin" type="text" inputmode="numeric" pattern="[0-9]{8}" maxlength="8" autocomplete="off" required placeholder="8-digit PIN"><button>Pair</button></form><p id="status"></p>
+    <script>document.getElementById('pair').onsubmit=async e=>{e.preventDefault();const status=document.getElementById('status');try{const r=await fetch('/pair',{method:'POST',body:document.getElementById('pin').value,headers:{'Content-Type':'text/plain'}});const text=await r.text();if(r.ok){document.open();document.write(text);document.close()}else{status.textContent=JSON.parse(text).error||'Pairing failed'}}catch{status.textContent='Connection lost'}}</script>
+    </html>
+    """
     static func html(token: String) -> String {
         let endpoint = "/import/\(token)/upload"
         return """

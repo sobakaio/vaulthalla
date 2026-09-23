@@ -141,6 +141,9 @@
     "Encrypted storage is device-bound and excluded from backups. Compaction reclaims reusable encrypted space." : {
 
     },
+    "Enter this PIN in the browser. Eight wrong attempts lock pairing until you restart Web Import. Use only a trusted Wi-Fi network: HTTP cannot protect against someone intercepting or changing traffic." : {
+
+    },
     "Enter your PIN" : {
 
     },
@@ -159,7 +162,7 @@
     "Failed" : {
 
     },
-    "Files travel directly to this iPhone over your local network. They are encrypted as they arrive. This page cannot view, download, or browse anything already in your vault." : {
+    "Files travel directly to this iPhone over your local network and are encrypted as they arrive. This page cannot browse your vault. The network transfer itself is not encrypted." : {
 
     },
     "Fill" : {
@@ -254,6 +257,9 @@
 
     },
     "Original filename" : {
+
+    },
+    "Pairing PIN: %@" : {
 
     },
     "Password failures" : {

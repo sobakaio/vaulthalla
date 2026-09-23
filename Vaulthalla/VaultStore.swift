@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Security
 
 actor VaultStore {
     static let shared = VaultStore()
@@ -36,17 +37,50 @@ actor VaultStore {
         fileManager.fileExists(atPath: headerURL.path)
     }
 
-    func createVault(password: String, segmentCapacity: SegmentCapacity) async throws {
+    func hasPendingCreation() -> Bool {
+        fileManager.fileExists(atPath: creationURL.path)
+    }
+
+    func hasCommittedIndex() -> Bool {
+        fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("index.v1").path)
+    }
+
+    private struct CreationJournal: Codable {
+        let header: VaultHeader
+        let sealedSecrets: Data
+    }
+
+    private var creationURL: URL { rootDirectory.appendingPathComponent("vault.creation") }
+    private var indexURL: URL { rootDirectory.appendingPathComponent("index.v1") }
+
+    func createVault(password: String, segmentCapacity: SegmentCapacity, stopAfterStaging: Bool = false) async throws {
         guard password.count >= VaultConstants.minimumPasswordLength && password.count <= VaultConstants.maximumPasswordLength else {
             throw VaultError.invalidPassword
         }
-        guard !hasVault() else { throw VaultError.vaultAlreadyExists }
+        // Onboarding calls this same entry point after restart. A staged vault
+        // resumes with its original capacity; it never starts a second creation.
+        if !hasVault(), fileManager.fileExists(atPath: creationURL.path) {
+            try await resumeCreation(password: password)
+            return
+        }
+        guard !hasVault(),
+              !fileManager.fileExists(atPath: indexURL.path),
+              !fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("index.v1.tmp").path) else {
+            throw VaultError.vaultAlreadyExists
+        }
+        // Never replace a pre-existing device binding, even if the header was lost.
+        do {
+            _ = try KeychainStore.loadDeviceSecret()
+            throw VaultError.vaultAlreadyExists
+        } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
+            // Fresh installation.
+        }
 
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         var rootValues = URLResourceValues()
         rootValues.isExcludedFromBackup = true
         var mutableRootDirectory = rootDirectory
-        try? mutableRootDirectory.setResourceValues(rootValues)
+        try mutableRootDirectory.setResourceValues(rootValues)
         let salt = VaultCrypto.randomData(count: 32)
         let deviceSecret = VaultCrypto.randomData(count: 32)
         let rootKey = SymmetricKey(size: .bits256)
@@ -57,27 +91,118 @@ actor VaultStore {
         let aad = VaultCrypto.headerAAD(segmentCapacity: segmentCapacity.bytes, salt: salt, iterations: iterations)
         let wrappedRootKey = try VaultCrypto.wrap(rootKey, with: kek, aad: aad)
         let header = VaultHeader(segmentCapacity: segmentCapacity.bytes, salt: salt, iterations: iterations, wrappedRootKey: wrappedRootKey, auditPublicKey: auditPrivate.publicKey.rawRepresentation)
-        let encoded = try JSONEncoder().encode(header)
-        let temporaryURL = rootDirectory.appendingPathComponent("vault.header.tmp")
-        try encoded.write(to: temporaryURL, options: .atomic)
+        // The device secret never appears in a file, even encrypted under the password.
+        // If power fails before the journal is durable, creation fails closed with an
+        // orphan Keychain binding rather than replacing it on the next attempt.
         try KeychainStore.saveDeviceSecret(deviceSecret)
-        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: temporaryURL.path)
-        if fileManager.fileExists(atPath: headerURL.path) {
-            _ = try fileManager.replaceItemAt(headerURL, withItemAt: temporaryURL)
-        } else {
-            try fileManager.moveItem(at: temporaryURL, to: headerURL)
-        }
-        try await blockStore.initialize(using: rootKey, auditPrivateKey: auditPrivate.rawRepresentation)
+        let sealed = try AES.GCM.seal(auditPrivate.rawRepresentation, using: rootKey, authenticating: Data("Vaulthalla-creation-v1".utf8))
+        let journal = CreationJournal(header: header, sealedSecrets: sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag)
+        try writeProtectedNewFile(try JSONEncoder().encode(journal), at: creationURL)
+        if stopAfterStaging { return }
+        try await resumeCreation(password: password)
     }
 
-    func unlock(password: String) throws -> SymmetricKey {
+    /// Resume only with the password that authenticated the staged creation.
+    /// No existing index or Keychain binding is replaced without verification.
+    func resumeCreation(password: String) async throws {
+        guard !hasVault(), let data = fileManager.contents(atPath: creationURL.path) else {
+            throw VaultError.noVault
+        }
+        let journal = try JSONDecoder().decode(CreationJournal.self, from: data)
+        try journal.header.validate()
+        let passwordKey = try PasswordKDF.deriveKey(password: password, salt: journal.header.salt, iterations: journal.header.iterations)
+        guard journal.sealedSecrets.count >= 28 else { throw VaultError.integrityFailure }
+        let box = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: journal.sealedSecrets.prefix(12)),
+            ciphertext: journal.sealedSecrets.dropFirst(12).dropLast(16),
+            tag: journal.sealedSecrets.suffix(16)
+        )
+        let deviceSecret = try KeychainStore.loadDeviceSecret()
+        let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
+        let rootKey: SymmetricKey
+        do {
+            rootKey = try VaultCrypto.unwrap(journal.header.wrappedRootKey, with: kek,
+                aad: VaultCrypto.headerAAD(segmentCapacity: journal.header.segmentCapacity, salt: journal.header.salt, iterations: journal.header.iterations))
+        } catch { throw VaultError.invalidPasswordOrDevice }
+        let auditPrivateKey: Data
+        do {
+            auditPrivateKey = try AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-creation-v1".utf8))
+        } catch { throw VaultError.integrityFailure }
+        guard let auditKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: auditPrivateKey),
+              auditKey.publicKey.rawRepresentation == journal.header.auditPublicKey else {
+            throw VaultError.integrityFailure
+        }
+        if fileManager.fileExists(atPath: indexURL.path) {
+            try await blockStore.load(using: rootKey)
+            let index = await blockStore.snapshot()
+            guard index.auditPrivateKey == auditPrivateKey,
+                  index.records.isEmpty, index.freeChunks.isEmpty else { throw VaultError.integrityFailure }
+        } else {
+            guard !fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("index.v1.tmp").path) else {
+                throw VaultError.storageFailure
+            }
+            try await blockStore.initialize(using: rootKey, auditPrivateKey: auditPrivateKey)
+        }
+        // Move the authenticated, protected header into place last.
+        let headerStage = rootDirectory.appendingPathComponent("vault.header.creation")
+        if !fileManager.fileExists(atPath: headerStage.path) {
+            try writeProtectedNewFile(try JSONEncoder().encode(journal.header), at: headerStage)
+        } else {
+            guard (try? Data(contentsOf: headerStage)) == (try JSONEncoder().encode(journal.header)) else {
+                throw VaultError.integrityFailure
+            }
+        }
+        try fileManager.moveItem(at: headerStage, to: headerURL)
+        try? fileManager.removeItem(at: creationURL)
+    }
+
+    private func writeProtectedNewFile(_ data: Data, at url: URL) throws {
+        guard !fileManager.fileExists(atPath: url.path),
+              fileManager.createFile(atPath: url.path, contents: nil,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]) else {
+            throw VaultError.storageFailure
+        }
+        var protectedURL = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedURL.setResourceValues(values)
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        #if targetEnvironment(simulator)
+        // Simulator filesystems do not report NSFileProtectionKey reliably.
+        // Keep the protection attribute on create, but verify it on hardware.
+        #else
+        guard attributes[.protectionKey] as? FileProtectionType == .completeUntilFirstUserAuthentication else {
+            throw VaultError.storageFailure
+        }
+        #endif
+        guard try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
+            throw VaultError.storageFailure
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+    }
+
+    func revokeAccess() async {
+        await blockStore.revokeAccess()
+    }
+
+    func unlock(password: String) async throws -> SymmetricKey {
         guard hasVault() else { throw VaultError.noVault }
         let header = try loadHeader()
         let deviceSecret = try KeychainStore.loadDeviceSecret()
         let passwordKey = try PasswordKDF.deriveKey(password: password, salt: header.salt, iterations: header.iterations)
         let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
         do {
-            return try VaultCrypto.unwrap(header.wrappedRootKey, with: kek, aad: VaultCrypto.headerAAD(segmentCapacity: header.segmentCapacity, salt: header.salt, iterations: header.iterations))
+            let key = try VaultCrypto.unwrap(header.wrappedRootKey, with: kek, aad: VaultCrypto.headerAAD(segmentCapacity: header.segmentCapacity, salt: header.salt, iterations: header.iterations))
+            await blockStore.activateAccess()
+            return key
         } catch {
             throw VaultError.invalidPasswordOrDevice
         }
@@ -103,15 +228,7 @@ actor VaultStore {
             wrappedRootKey: wrappedRootKey,
             auditPublicKey: header.auditPublicKey
         )
-        let temporaryURL = headerURL.appendingPathExtension("tmp")
-        let encoded = try JSONEncoder().encode(updatedHeader)
-        try encoded.write(to: temporaryURL, options: .atomic)
-        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: temporaryURL.path)
-        if fileManager.fileExists(atPath: headerURL.path) {
-            _ = try fileManager.replaceItemAt(headerURL, withItemAt: temporaryURL)
-        } else {
-            try fileManager.moveItem(at: temporaryURL, to: headerURL)
-        }
+        try replaceHeader(updatedHeader)
     }
 
     struct StorageStatistics: Equatable {
@@ -136,10 +253,14 @@ actor VaultStore {
         )
     }
 
-    func destroyVault() {
+    func destroyVault() async throws {
+        await blockStore.revokeAccess()
         // Key destruction is deliberately first; filesystem cleanup cannot restore access.
-        KeychainStore.deleteDeviceSecret()
-        try? fileManager.removeItem(at: rootDirectory)
+        try KeychainStore.deleteDeviceSecret()
+        if fileManager.fileExists(atPath: rootDirectory.path) {
+            try fileManager.removeItem(at: rootDirectory)
+        }
+        guard !fileManager.fileExists(atPath: rootDirectory.path) else { throw VaultError.storageFailure }
     }
 
     func importFile(at url: URL, rootKey: SymmetricKey) async throws -> MediaRecord? {
@@ -217,11 +338,32 @@ actor VaultStore {
         let plaintext = try JSONEncoder().encode(rotation)
         let sealed = try AES.GCM.seal(plaintext, using: rootKey, authenticating: Data("Vaulthalla-audit-rotation-v1".utf8))
         let journal = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
-        try journal.write(to: auditRotationURL, options: .atomic)
+        let stagingURL = rootDirectory.appendingPathComponent("audit.rotation.\(UUID().uuidString).tmp")
+        guard fileManager.createFile(
+            atPath: stagingURL.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        ) else { throw VaultError.storageFailure }
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        var protectedURL = stagingURL
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
-        var mutableURL = auditRotationURL
-        try? mutableURL.setResourceValues(values)
+        try protectedURL.setResourceValues(values)
+        let attributes = try fileManager.attributesOfItem(atPath: stagingURL.path)
+        guard attributes[.protectionKey] as? FileProtectionType == .complete,
+              try stagingURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
+            throw VaultError.storageFailure
+        }
+        let handle = try FileHandle(forWritingTo: stagingURL)
+        do {
+            try handle.write(contentsOf: journal)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        try fileManager.moveItem(at: stagingURL, to: auditRotationURL)
 
         // The journal is durable before the old log is removed. If the process is
         // interrupted from this point onward, recovery can safely finish rotation.
@@ -263,9 +405,35 @@ actor VaultStore {
             wrappedRootKey: header.wrappedRootKey,
             auditPublicKey: publicKey
         )
-        let temporaryURL = headerURL.appendingPathExtension("tmp")
-        try JSONEncoder().encode(updated).write(to: temporaryURL, options: .atomic)
-        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: temporaryURL.path)
+        try replaceHeader(updated)
+    }
+
+    private func replaceHeader(_ header: VaultHeader) throws {
+        let temporaryURL = rootDirectory.appendingPathComponent("vault.header.\(UUID().uuidString).tmp")
+        guard fileManager.createFile(
+            atPath: temporaryURL.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        ) else { throw VaultError.storageFailure }
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+        var protectedURL = temporaryURL
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedURL.setResourceValues(values)
+        let attributes = try fileManager.attributesOfItem(atPath: temporaryURL.path)
+        guard attributes[.protectionKey] as? FileProtectionType == .completeUntilFirstUserAuthentication,
+              try temporaryURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true else {
+            throw VaultError.storageFailure
+        }
+        let handle = try FileHandle(forWritingTo: temporaryURL)
+        do {
+            try handle.write(contentsOf: JSONEncoder().encode(header))
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
         _ = try fileManager.replaceItemAt(headerURL, withItemAt: temporaryURL)
     }
 

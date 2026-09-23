@@ -41,84 +41,95 @@ enum AttemptPolicy {
 actor AttemptStateStore {
     static let shared = AttemptStateStore()
     private let service = "io.sobaka.vaulthalla"
-    private let account = "attempt-state-v1"
+    private let account: String
 
-    func load() -> AttemptState {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+    init(account: String = "attempt-state-v1") {
+        self.account = account
+    }
+
+    enum PersistenceError: Error { case keychain(OSStatus), invalidData, readbackMismatch, destructionRequired }
+
+    private var query: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    func loadChecked() throws -> AttemptState {
+        var request = query
+        request[kSecReturnData as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return AttemptState() }
+        guard status == errSecSuccess else { throw PersistenceError.keychain(status) }
+        guard let data = result as? Data,
               let state = try? JSONDecoder().decode(AttemptState.self, from: data) else {
-            return AttemptState()
+            throw PersistenceError.invalidData
         }
         return state
     }
 
-    func save(_ state: AttemptState) {
-        guard let data = try? JSONEncoder().encode(state) else { return }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
-        let add: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            kSecAttrSynchronizable as String: false
-        ]
-        SecItemAdd(add as CFDictionary, nil)
+    func saveChecked(_ state: AttemptState) throws {
+        let data = try JSONEncoder().encode(state)
+        let attributes: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = query
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            add[kSecAttrSynchronizable as String] = false
+            let added = SecItemAdd(add as CFDictionary, nil)
+            guard added == errSecSuccess else { throw PersistenceError.keychain(added) }
+        } else if status != errSecSuccess {
+            throw PersistenceError.keychain(status)
+        }
+        guard try loadChecked() == state else { throw PersistenceError.readbackMismatch }
     }
 
-    func recordFailure(method: UnlockMethod) -> AttemptState {
-        var state = load()
+    func recordFailureChecked(method: UnlockMethod) throws -> AttemptState {
+        var state = try loadChecked()
         switch method {
         case .password:
             state.passwordFailures += 1
-            if state.autoDestroyEnabled {
-                state.destructivePasswordFailures += 1
-            }
-        case .pin:
-            state.pinFailures += 1
-        case .faceID:
-            state.faceIDFailures += 1
+            if state.autoDestroyEnabled { state.destructivePasswordFailures += 1 }
+        case .pin: state.pinFailures += 1
+        case .faceID: state.faceIDFailures += 1
         }
-        save(state)
+        try saveChecked(state)
         return state
     }
 
-    func recordSuccess(method: UnlockMethod) -> AttemptState {
-        var state = load()
+    func recordSuccessChecked(method: UnlockMethod) throws -> AttemptState {
+        var state = try loadChecked()
+        guard !AttemptPolicy.shouldDestroy(state: state) else { throw PersistenceError.destructionRequired }
         switch method {
         case .password:
             state.passwordFailures = 0
             state.destructivePasswordFailures = 0
             state.pinFailures = 0
             state.faceIDFailures = 0
-        case .pin:
-            state.pinFailures = 0
-        case .faceID:
-            state.faceIDFailures = 0
+        case .pin: state.pinFailures = 0
+        case .faceID: state.faceIDFailures = 0
         }
-        save(state)
+        try saveChecked(state)
         return state
     }
 
-    func configure(_ update: (inout AttemptState) -> Void) -> AttemptState {
-        var state = load()
+    func configureChecked(_ update: (inout AttemptState) -> Void) throws -> AttemptState {
+        var state = try loadChecked()
         update(&state)
-        save(state)
+        try saveChecked(state)
         return state
     }
+
+    // Legacy nonthrowing entry points are retained for existing call sites/tests.
+    // Security decisions must use the checked variants above.
+    func load() -> AttemptState { (try? loadChecked()) ?? AttemptState() }
+    func save(_ state: AttemptState) { try? saveChecked(state) }
+    func recordFailure(method: UnlockMethod) -> AttemptState { (try? recordFailureChecked(method: method)) ?? AttemptState() }
+    func recordSuccess(method: UnlockMethod) -> AttemptState { (try? recordSuccessChecked(method: method)) ?? AttemptState() }
+    func configure(_ update: (inout AttemptState) -> Void) -> AttemptState { (try? configureChecked(update)) ?? AttemptState() }
 
     func erase() {
         let query: [String: Any] = [

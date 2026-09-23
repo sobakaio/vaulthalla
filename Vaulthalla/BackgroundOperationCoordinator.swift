@@ -5,84 +5,69 @@ import BackgroundTasks
 final class BackgroundOperationCoordinator {
     static let shared = BackgroundOperationCoordinator()
     private static let taskIdentifier = "io.sobaka.vaulthalla.continued"
-    private var handler: (@MainActor () async -> Bool)?
-    private var operationRunning = false
     private var activeOperation: Task<Void, Never>?
-    private var pendingOperation: (@MainActor () async -> Bool)?
+    private var queued: [@MainActor () async -> Bool] = []
+    private var generation = 0
 
     private init() {}
 
     func register() {
         guard #available(iOS 26.0, *) else { return }
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.taskIdentifier, using: nil) { [weak self] task in
-            guard let task = task as? BGContinuedProcessingTask else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            task.expirationHandler = {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.taskIdentifier, using: nil) { task in
+            // Foreground submission owns the operation. A background request only
+            // extends its lifetime; it must never invoke the same closure twice.
+            task.expirationHandler = { [weak self] in
+                Task { @MainActor in self?.cancelCurrentOperation() }
                 task.setTaskCompleted(success: false)
             }
             Task { @MainActor [weak self] in
-                guard let self, !self.operationRunning else {
-                    task.setTaskCompleted(success: true)
-                    return
-                }
-                self.operationRunning = true
-                let operation = self.handler
-                self.handler = nil
-                let success = await operation?() ?? false
-                self.operationRunning = false
-                if let pending = self.pendingOperation {
-                    self.pendingOperation = nil
-                    self.runOperation(pending)
-                }
-                task.setTaskCompleted(success: success)
+                await self?.waitUntilIdle()
+                task.setTaskCompleted(success: true)
             }
         }
     }
 
-    func submit(
-        title: String,
-        subtitle: String,
-        operation: @escaping @MainActor () async -> Bool
-    ) {
-        handler = operation
-        // Never silently drop an import: if an operation is already running
-        // (e.g. a Wi‑Fi upload still finishing), the new one runs right after.
-        if operationRunning {
-            pendingOperation = operation
-        } else {
-            runOperation(operation)
-        }
-
+    func submit(title: String, subtitle: String, operation: @escaping @MainActor () async -> Bool) {
+        queued.append(operation)
+        startNext()
         guard #available(iOS 26.0, *) else { return }
         let request = BGContinuedProcessingTaskRequest(
-            identifier: Self.taskIdentifier,
-            title: title,
-            subtitle: subtitle
+            identifier: Self.taskIdentifier, title: title, subtitle: subtitle
         )
         request.strategy = .queue
         try? BGTaskScheduler.shared.submit(request)
     }
 
-    private func runOperation(_ operation: @escaping @MainActor () async -> Bool) {
-        operationRunning = true
+    private func startNext() {
+        guard activeOperation == nil, !queued.isEmpty else { return }
+        let operation = queued.removeFirst()
+        let currentGeneration = generation
         activeOperation = Task { @MainActor [weak self] in
             _ = await operation()
             guard let self else { return }
-            self.operationRunning = false
             self.activeOperation = nil
-            if let pending = self.pendingOperation {
-                self.pendingOperation = nil
-                self.runOperation(pending)
-            }
+            if self.generation == currentGeneration { self.startNext() }
         }
     }
 
     func cancelCurrentOperation() {
+        generation &+= 1
+        queued.removeAll()
         activeOperation?.cancel()
-        pendingOperation = nil
     }
+
+    /// Wait for cooperative cancellation before removing vault files.
+    func cancelAndDrain() async {
+        cancelCurrentOperation()
+        await waitUntilIdle()
+    }
+
+    private func waitUntilIdle() async {
+        while let activeOperation {
+            await activeOperation.value
+        }
+    }
+
 }
 
 /// Keeps the app alive in the background for the duration of a Web Import

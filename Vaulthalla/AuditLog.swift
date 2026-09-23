@@ -63,11 +63,18 @@ struct AuditLogStore {
     private func writeEntries(_ entries: [LockedAuditEntry]) throws {
         try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(entries)
-        try data.write(to: logURL, options: .atomic)
+        let temporary = logURL.appendingPathExtension("tmp")
+        try data.write(to: temporary, options: .atomic)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: temporary.path)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
-        var mutableURL = logURL
-        try? mutableURL.setResourceValues(values)
+        var mutableURL = temporary
+        try mutableURL.setResourceValues(values)
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            _ = try FileManager.default.replaceItemAt(logURL, withItemAt: temporary)
+        } else {
+            try FileManager.default.moveItem(at: temporary, to: logURL)
+        }
     }
 
     func decrypt(using privateKeyData: Data) throws -> [AuditEvent] {
