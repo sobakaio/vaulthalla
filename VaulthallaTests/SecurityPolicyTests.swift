@@ -93,6 +93,27 @@ struct SecurityPolicyTests {
         await attempts.erase()
     }
 
+    #if !targetEnvironment(simulator)
+    @Test(.serialized) func existingVaultBindingStatusIsReadOnly() throws {
+        let manager = FileManager.default
+        let directory = try #require(manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+            .appendingPathComponent("Vaulthalla", isDirectory: true)
+        let header = manager.fileExists(atPath: directory.appendingPathComponent("vault.header").path)
+        let index = manager.fileExists(atPath: directory.appendingPathComponent("index.v1").path)
+        let creation = manager.fileExists(atPath: directory.appendingPathComponent("vault.creation").path)
+        let bindingStatus: String
+        do {
+            bindingStatus = try KeychainStore.loadDeviceSecret().count == 32 ? "present" : "invalid-length"
+        } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
+            bindingStatus = "missing"
+        } catch {
+            bindingStatus = "unavailable"
+        }
+        print("Read-only physical vault state: header=\(header), index=\(index), creation=\(creation), device-binding=\(bindingStatus)")
+        if header || index || creation { #expect(bindingStatus == "present") }
+    }
+    #endif
+
     @Test(.serialized) func checkedConvenienceRemovalUsesIsolatedKeychainAccount() throws {
         let account = "convenience-removal-test-\(UUID().uuidString)"
         let query: [String: Any] = [

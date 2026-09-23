@@ -15,6 +15,16 @@ actor VaultStore {
         let publicKey: Data
     }
 
+    #if DEBUG
+    enum AuditRotationBoundary: CaseIterable, Sendable {
+        case journalCommitted, logErased, headerCommitted, indexCommitted
+    }
+    private var auditRotationFault: (@Sendable (AuditRotationBoundary) throws -> Void)?
+    func injectAuditRotationFault(_ fault: (@Sendable (AuditRotationBoundary) throws -> Void)?) {
+        auditRotationFault = fault
+    }
+    #endif
+
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fileManager.temporaryDirectory
@@ -391,17 +401,32 @@ actor VaultStore {
             throw error
         }
         try fileManager.moveItem(at: stagingURL, to: auditRotationURL)
+        #if DEBUG
+        try auditRotationFault?(.journalCommitted)
+        #endif
 
         // The journal is durable before the old log is removed. If the process is
         // interrupted from this point onward, recovery can safely finish rotation.
         try audit.erase()
+        #if DEBUG
+        try auditRotationFault?(.logErased)
+        #endif
         try writeHeader(withAuditPublicKey: rotation.publicKey, basedOn: header)
+        #if DEBUG
+        try auditRotationFault?(.headerCommitted)
+        #endif
         try await blockStore.replaceAuditPrivateKey(rotation.privateKey, using: rootKey)
+        #if DEBUG
+        try auditRotationFault?(.indexCommitted)
+        #endif
         try? fileManager.removeItem(at: auditRotationURL)
     }
 
     private func completeAuditRotation(using rootKey: SymmetricKey) async throws {
-        guard let journalData = fileManager.contents(atPath: auditRotationURL.path) else { return }
+        guard fileManager.fileExists(atPath: auditRotationURL.path) else { return }
+        guard let journalData = fileManager.contents(atPath: auditRotationURL.path) else {
+            throw VaultError.storageFailure
+        }
         guard journalData.count >= 28 else { throw VaultError.integrityFailure }
         let nonce = try AES.GCM.Nonce(data: journalData.prefix(12))
         let box = try AES.GCM.SealedBox(
