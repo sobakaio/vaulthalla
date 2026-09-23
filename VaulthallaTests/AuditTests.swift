@@ -183,6 +183,41 @@ struct AuditTests {
     }
     #endif
 
+    @Test func missingRotationJournalWithMismatchedKeysBlocksUnlock() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("Vaulthalla", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let key = SymmetricKey(size: .bits256)
+        let oldPrivate = Curve25519.KeyAgreement.PrivateKey()
+        let newPrivate = Curve25519.KeyAgreement.PrivateKey()
+        var index = VaultIndex()
+        index.auditPrivateKey = oldPrivate.rawRepresentation
+        index.auditPrivacyVersion = 1
+        let sealed = try AES.GCM.seal(JSONEncoder().encode(index), using: key,
+                                      authenticating: Data("Vaulthalla-index-v1".utf8))
+        let indexData = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
+        let indexURL = root.appendingPathComponent("index.v1")
+        try indexData.write(to: indexURL)
+        let header = VaultHeader(segmentCapacity: SegmentCapacity.megabytes50.bytes,
+                                 salt: Data(repeating: 1, count: 32), iterations: 100_000,
+                                 wrappedRootKey: Data(repeating: 2, count: 60),
+                                 auditPublicKey: newPrivate.publicKey.rawRepresentation)
+        let headerData = try JSONEncoder().encode(header)
+        let headerURL = root.appendingPathComponent("vault.header")
+        try headerData.write(to: headerURL)
+        let store = VaultStore(fileManager: RedirectedFileManager(replacement: base))
+        await #expect(throws: VaultError.authenticatedIndexMismatch) {
+            try await store.purgeLegacyAuditSecrets(using: key)
+        }
+        await #expect(throws: VaultError.authenticatedIndexMismatch) {
+            _ = try await store.readAudit(using: key)
+        }
+        #expect(try Data(contentsOf: indexURL) == indexData)
+        #expect(try Data(contentsOf: headerURL) == headerData)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("audit.rotation").path))
+    }
+
     @Test func unreadableAuditRotationJournalBlocksWithoutChangingVault() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }

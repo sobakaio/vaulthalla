@@ -472,6 +472,13 @@ final class VaultAppModel {
                 _ = await requireDeviceBinding()
                 return
             }
+            if (error as? VaultError) == .invalidHeader {
+                await completeAutoDestroy()
+                if phase == .onboarding {
+                    destructionMessage = "Vault destroyed after confirmed header corruption."
+                }
+                return
+            }
             guard (error as? VaultError) == .invalidPasswordOrDevice else {
                 errorMessage = "Unlock unavailable. Security state preserved."
                 return
@@ -624,6 +631,13 @@ final class VaultAppModel {
         }
         do {
             try await store.purgeLegacyAuditSecrets(using: key)
+        } catch VaultError.authenticatedIndexMismatch, VaultError.integrityFailure, VaultError.invalidHeader {
+            guard sessionGeneration == generation else { return }
+            await completeAutoDestroy()
+            if phase == .onboarding {
+                destructionMessage = "Vault destroyed after confirmed, unrecoverable audit integrity failure."
+            }
+            return
         } catch {
             if sessionGeneration == generation {
                 rootKey = nil
@@ -1260,6 +1274,12 @@ final class VaultAppModel {
             // the model after that transition, and never retain legacy inputs.
             guard sessionGeneration == generation, phase == .unlocked, self.rootKey != nil else { return }
             auditEvents = events.reversed().map(\.metadataOnly)
+        } catch VaultError.authenticatedIndexMismatch, VaultError.integrityFailure {
+            guard sessionGeneration == generation, phase == .unlocked else { return }
+            await completeAutoDestroy()
+            if phase == .onboarding {
+                destructionMessage = "Vault destroyed after confirmed, unrecoverable audit integrity failure."
+            }
         } catch {
             guard sessionGeneration == generation, phase == .unlocked else { return }
             errorMessage = "Security Activity is unavailable."

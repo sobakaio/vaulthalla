@@ -331,8 +331,7 @@ actor VaultStore {
     func readAudit(using rootKey: SymmetricKey) async throws -> [AuditEvent] {
         try await completeAuditRotation(using: rootKey)
         try await blockStore.load(using: rootKey)
-        let index = await blockStore.snapshot()
-        guard let privateKey = index.auditPrivateKey else { throw VaultError.integrityFailure }
+        let privateKey = try await requireMatchingAuditKey()
         let header = try loadHeader()
         let audit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
         return try audit.decrypt(using: privateKey)
@@ -355,6 +354,22 @@ actor VaultStore {
            fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("audit.log").path) {
             try await eraseAudit(using: rootKey)
         }
+        // A missing journal after a partial header/index commit cannot be repaired
+        // by guessing which key is current. Block unlock without destroying data.
+        _ = try await requireMatchingAuditKey()
+    }
+
+    private func requireMatchingAuditKey() async throws -> Data {
+        let index = await blockStore.snapshot()
+        guard let privateKey = index.auditPrivateKey,
+              let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey) else {
+            throw VaultError.authenticatedIndexMismatch
+        }
+        let header = try loadHeader()
+        guard key.publicKey.rawRepresentation == header.auditPublicKey else {
+            throw VaultError.authenticatedIndexMismatch
+        }
+        return privateKey
     }
 
     func eraseAudit(using rootKey: SymmetricKey) async throws {
@@ -428,16 +443,23 @@ actor VaultStore {
             throw VaultError.storageFailure
         }
         guard journalData.count >= 28 else { throw VaultError.integrityFailure }
-        let nonce = try AES.GCM.Nonce(data: journalData.prefix(12))
-        let box = try AES.GCM.SealedBox(
-            nonce: nonce,
-            ciphertext: journalData.dropFirst(12).dropLast(16),
-            tag: journalData.suffix(16)
-        )
-        let rotation = try JSONDecoder().decode(
-            AuditRotation.self,
-            from: try AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-audit-rotation-v1".utf8))
-        )
+        let rotation: AuditRotation
+        do {
+            let nonce = try AES.GCM.Nonce(data: journalData.prefix(12))
+            let box = try AES.GCM.SealedBox(
+                nonce: nonce,
+                ciphertext: journalData.dropFirst(12).dropLast(16),
+                tag: journalData.suffix(16)
+            )
+            rotation = try JSONDecoder().decode(
+                AuditRotation.self,
+                from: try AES.GCM.open(box, using: rootKey, authenticating: Data("Vaulthalla-audit-rotation-v1".utf8))
+            )
+        } catch { throw VaultError.integrityFailure }
+        guard let journalKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: rotation.privateKey),
+              journalKey.publicKey.rawRepresentation == rotation.publicKey else {
+            throw VaultError.integrityFailure
+        }
         let header = try loadHeader()
         try await blockStore.load(using: rootKey)
         let oldAudit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
@@ -549,8 +571,11 @@ actor VaultStore {
     }
 
     func loadHeader() throws -> VaultHeader {
-        guard let data = fileManager.contents(atPath: headerURL.path) else { throw VaultError.noVault }
-        let header = try JSONDecoder().decode(VaultHeader.self, from: data)
+        guard fileManager.fileExists(atPath: headerURL.path) else { throw VaultError.noVault }
+        guard let data = fileManager.contents(atPath: headerURL.path) else { throw VaultError.storageFailure }
+        let header: VaultHeader
+        do { header = try JSONDecoder().decode(VaultHeader.self, from: data) }
+        catch { throw VaultError.invalidHeader }
         try header.validate()
         return header
     }
