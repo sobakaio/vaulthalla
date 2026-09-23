@@ -36,6 +36,10 @@ enum AttemptPolicy {
         state.autoDestroyEnabled &&
         state.destructivePasswordFailures >= state.autoDestroyThreshold
     }
+
+    static func convenienceLockedOut(state: AttemptState) -> Bool {
+        state.pinFailures >= state.pinThreshold || state.faceIDFailures >= state.faceIDThreshold
+    }
 }
 
 actor AttemptStateStore {
@@ -103,8 +107,9 @@ actor AttemptStateStore {
     func recordSuccessChecked(method: UnlockMethod) throws -> AttemptState {
         var state = try loadChecked()
         guard !AttemptPolicy.shouldDestroy(state: state) else { throw PersistenceError.destructionRequired }
-        if method == .pin, state.pinFailures >= state.pinThreshold { throw PersistenceError.convenienceLockedOut }
-        if method == .faceID, state.faceIDFailures >= state.faceIDThreshold { throw PersistenceError.convenienceLockedOut }
+        if method != .password, AttemptPolicy.convenienceLockedOut(state: state) {
+            throw PersistenceError.convenienceLockedOut
+        }
         switch method {
         case .password:
             state.passwordFailures = 0

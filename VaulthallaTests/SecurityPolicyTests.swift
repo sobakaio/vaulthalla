@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CryptoKit
+import Security
 @testable import Vaulthalla
 
 struct SecurityPolicyTests {
@@ -51,7 +52,7 @@ struct SecurityPolicyTests {
         let attempts = AttemptStateStore(account: "lockout-test-\(UUID().uuidString)")
         var state = AttemptState()
         state.pinFailures = state.pinThreshold
-        state.faceIDFailures = state.faceIDThreshold
+        state.faceIDFailures = 0
         try await attempts.saveChecked(state)
         await #expect(throws: AttemptStateStore.PersistenceError.self) {
             try await attempts.recordSuccessChecked(method: .pin)
@@ -80,8 +81,45 @@ struct SecurityPolicyTests {
         model.faceIDEnabled = true
         await model.loadSecuritySettings()
         #expect(!model.pinEnabled && !model.faceIDEnabled)
+        state.pinFailures = 0
+        state.faceIDFailures = state.faceIDThreshold
+        try await attempts.saveChecked(state)
+        await #expect(throws: AttemptStateStore.PersistenceError.self) {
+            try await attempts.recordSuccessChecked(method: .pin)
+        }
+        model.pinEnabled = true
+        await model.unlockWithPIN()
+        #expect(!model.pinEnabled && model.phase == .locked)
         await attempts.erase()
     }
+
+    @Test(.serialized) func checkedConvenienceRemovalUsesIsolatedKeychainAccount() throws {
+        let account = "convenience-removal-test-\(UUID().uuidString)"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrAccount as String: account
+        ]
+        defer { SecItemDelete(query as CFDictionary) }
+        var add = query
+        add[kSecValueData as String] = Data("isolated-test-record".utf8)
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        #expect(SecItemAdd(add as CFDictionary, nil) == errSecSuccess)
+        try ConvenienceUnlockStore.removeChecked(account: account)
+        try ConvenienceUnlockStore.removeChecked(account: account) // Idempotent not-found path.
+        var check = query
+        check[kSecReturnAttributes as String] = true
+        var result: CFTypeRef?
+        #expect(SecItemCopyMatching(check as CFDictionary, &result) == errSecItemNotFound)
+    }
+
+    #if targetEnvironment(simulator)
+    @Test(.serialized) func checkedConvenienceRemovalVerifiesAbsence() throws {
+        try ConvenienceUnlockStore.removeAllChecked()
+        #expect(!ConvenienceUnlockStore.hasPIN())
+        #expect(!ConvenienceUnlockStore.hasFaceID())
+    }
+    #endif
 
     @Test(.serialized) @MainActor func attemptStoreAndFaceIDStateMachine() async {
         let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
@@ -124,7 +162,7 @@ struct SecurityPolicyTests {
 
         await model.unlockWithFaceID()
         #expect(!model.faceIDEnabled)
-        #expect(model.errorMessage.contains("disabled"))
+        #expect(model.errorMessage.contains("locked out"))
 
         // Part 3 — a valid biometric result clears its counter, but a missing
         // vault index must not expose the unlocked UI.

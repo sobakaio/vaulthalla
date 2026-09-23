@@ -445,6 +445,21 @@ final class VaultAppModel {
         do {
             let unlockedKey = try await store.unlock(password: pendingPassword)
             guard canFinishUnlock(generation) else { return }
+            guard let verifiedState = try? await attemptStore.loadChecked() else {
+                errorMessage = "Security state unavailable. Unlock blocked."
+                return
+            }
+            if AttemptPolicy.convenienceLockedOut(state: verifiedState) {
+                do {
+                    try ConvenienceUnlockStore.removeAllChecked()
+                    pinEnabled = false
+                    faceIDEnabled = false
+                } catch {
+                    pendingPassword = ""
+                    errorMessage = "Convenience credentials could not be removed. Password unlock blocked; retry."
+                    return
+                }
+            }
             guard let persisted = try? await attemptStore.recordSuccessChecked(method: .password) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
             unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .password, result: "success", enteredSecret: nil))
@@ -1137,10 +1152,10 @@ final class VaultAppModel {
         guard await requireDeviceBinding() else { return }
         guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
         if AttemptPolicy.shouldDestroy(state: state) { await completeAutoDestroy(); return }
-        guard state.pinFailures < state.pinThreshold else {
+        guard !AttemptPolicy.convenienceLockedOut(state: state) else {
             pinEnabled = false
             pendingPIN = ""
-            errorMessage = "PIN disabled after too many failed attempts."
+            errorMessage = "Convenience unlock locked out after too many failed attempts."
             return
         }
         let delay = AttemptPolicy.delay(for: state.pinFailures)
@@ -1161,9 +1176,12 @@ final class VaultAppModel {
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "failure", enteredSecret: nil))
             pendingPIN = ""
             if next.pinFailures >= next.pinThreshold {
-                ConvenienceUnlockStore.removeAll()
+                let removed = (try? ConvenienceUnlockStore.removeAllChecked()) != nil
                 pinEnabled = false
-                errorMessage = "PIN disabled after too many failed attempts."
+                faceIDEnabled = false
+                errorMessage = removed
+                    ? "Convenience unlock locked out after too many failed attempts."
+                    : "Convenience unlock locked out; Keychain removal could not be verified. Use password to retry."
                 await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "pin-lockout", enteredSecret: nil))
             } else {
                 errorMessage = "Incorrect PIN."
@@ -1183,9 +1201,9 @@ final class VaultAppModel {
         guard await requireDeviceBinding() else { return }
         guard let persistedState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
         if AttemptPolicy.shouldDestroy(state: persistedState) { await completeAutoDestroy(); return }
-        guard persistedState.faceIDFailures < persistedState.faceIDThreshold else {
+        guard !AttemptPolicy.convenienceLockedOut(state: persistedState) else {
             faceIDEnabled = false
-            errorMessage = "Face ID disabled after too many failed attempts."
+            errorMessage = "Convenience unlock locked out after too many failed attempts."
             return
         }
         isBusy = true
@@ -1204,9 +1222,12 @@ final class VaultAppModel {
             unlockStatistics = next
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "failure", enteredSecret: nil))
             if next.faceIDFailures >= next.faceIDThreshold {
-                ConvenienceUnlockStore.removeAll()
+                let removed = (try? ConvenienceUnlockStore.removeAllChecked()) != nil
                 faceIDEnabled = false
-                errorMessage = "Face ID disabled after too many failed attempts."
+                pinEnabled = false
+                errorMessage = removed
+                    ? "Convenience unlock locked out after too many failed attempts."
+                    : "Convenience unlock locked out; Keychain removal could not be verified. Use password to retry."
                 await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "faceid-lockout", enteredSecret: nil))
             } else {
                 errorMessage = "Face ID authentication failed."
@@ -1224,8 +1245,10 @@ final class VaultAppModel {
         autoDestroyThreshold = state.autoDestroyThreshold
         pinFailureThreshold = state.pinThreshold
         faceIDFailureThreshold = state.faceIDThreshold
-        if state.pinFailures >= state.pinThreshold { pinEnabled = false }
-        if state.faceIDFailures >= state.faceIDThreshold { faceIDEnabled = false }
+        if AttemptPolicy.convenienceLockedOut(state: state) {
+            pinEnabled = false
+            faceIDEnabled = false
+        }
     }
 
     func loadAuditEvents() async {
@@ -1318,38 +1341,59 @@ final class VaultAppModel {
 
     func enablePIN(_ pin: String) {
         guard let rootKey else { return }
+        guard (4...8).contains(pin.count), pin.allSatisfy(\.isNumber) else {
+            errorMessage = "PIN must contain 4–8 digits."
+            return
+        }
+        do {
+            try ConvenienceUnlockStore.removeFaceIDChecked()
+        } catch {
+            errorMessage = "Face ID removal could not be verified. It may still be active; retry."
+            return
+        }
+        faceIDEnabled = false
         do {
             try ConvenienceUnlockStore.configurePIN(pin, rootKey: rootKey)
-            ConvenienceUnlockStore.removeFaceID()
             pinEnabled = true
-            faceIDEnabled = false
             Task {
                 await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "convenience-unlock-enabled pin", enteredSecret: nil))
             }
         } catch {
-            errorMessage = "PIN must contain 4–8 digits."
+            pinEnabled = ConvenienceUnlockStore.hasPIN()
+            errorMessage = "PIN setup failed. An old PIN may still be active; use your password and retry."
         }
     }
 
     func enableFaceID() async {
         guard let rootKey else { return }
         do {
+            try ConvenienceUnlockStore.removePINChecked()
+        } catch {
+            errorMessage = "PIN removal could not be verified. It may still be active; retry."
+            return
+        }
+        pinEnabled = false
+        do {
             try ConvenienceUnlockStore.configureFaceID(rootKey)
-            ConvenienceUnlockStore.removePIN()
             faceIDEnabled = true
-            pinEnabled = false
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "convenience-unlock-enabled faceID", enteredSecret: nil))
         } catch {
-            errorMessage = "Face ID is unavailable or not configured."
+            // A failed replacement may leave the previous biometric wrapper in Keychain.
+            // Do not claim that it was removed or that password is the only method.
+            errorMessage = "Face ID setup failed. An old Face ID key may still be active; use your password and retry."
         }
     }
 
     func disableConvenienceUnlock() {
-        ConvenienceUnlockStore.removeAll()
-        pinEnabled = false
-        faceIDEnabled = false
-        Task {
-            await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "convenience-unlock-disabled", enteredSecret: nil))
+        do {
+            try ConvenienceUnlockStore.removeAllChecked()
+            pinEnabled = false
+            faceIDEnabled = false
+            Task {
+                await store.appendAudit(AuditEvent(timestamp: Date(), method: .lifecycle, result: "convenience-unlock-disabled", enteredSecret: nil))
+            }
+        } catch {
+            errorMessage = "Convenience credentials could not be removed. Retry; they may still be active."
         }
     }
 

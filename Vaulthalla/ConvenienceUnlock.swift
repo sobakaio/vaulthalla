@@ -58,12 +58,7 @@ enum ConvenienceUnlockStore {
         ) else {
             throw ConvenienceUnlockError.unavailable
         }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: faceIDAccount
-        ]
-        SecItemDelete(query as CFDictionary)
+        try removeChecked(account: faceIDAccount)
         let add: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -103,26 +98,25 @@ enum ConvenienceUnlockStore {
         load(account: faceIDAccount) != nil
     }
 
-    static func removeAll() {
-        removePIN()
-        removeFaceID()
+    static func removeAllChecked() throws {
+        // Attempt both removals even if the first Keychain operation fails.
+        var pinFailed = false
+        var faceIDFailed = false
+        do { try removeChecked(account: pinAccount) } catch { pinFailed = true }
+        do { try removeChecked(account: faceIDAccount) } catch { faceIDFailed = true }
+        if pinFailed || faceIDFailed { throw ConvenienceUnlockError.unavailable }
     }
 
-    static func removePIN() {
-        remove(account: pinAccount)
+    static func removePINChecked() throws {
+        try removeChecked(account: pinAccount)
     }
 
-    static func removeFaceID() {
-        remove(account: faceIDAccount)
+    static func removeFaceIDChecked() throws {
+        try removeChecked(account: faceIDAccount)
     }
 
     private static func save(_ data: Data, account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
+        try removeChecked(account: account)
         let add: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -136,13 +130,26 @@ enum ConvenienceUnlockStore {
         }
     }
 
-    private static func remove(account: String) {
+    // Internal so tests can verify the real Keychain path with isolated accounts.
+    static func removeChecked(account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw ConvenienceUnlockError.unavailable
+        }
+        var check = query
+        check[kSecReturnAttributes as String] = true
+        check[kSecMatchLimit as String] = kSecMatchLimitOne
+        // Never prompt for biometrics merely to verify absence.
+        check[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(check as CFDictionary, &result) == errSecItemNotFound else {
+            throw ConvenienceUnlockError.unavailable
+        }
     }
 
     private static func load(account: String) -> Data? {
