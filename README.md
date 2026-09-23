@@ -29,12 +29,12 @@ The vault is deliberately **one-way**: it does not offer export, sharing, Save t
 
 ### Import media your way
 
-Vaulthalla provides three import paths in normal builds. A fourth, Local Web Import, is present only for controlled development testing:
+Vaulthalla has three established import paths. A Local Web Import server implementation is also under security review while its transport design is decided:
 
 - **Photos** — select images and videos from the iPhone photo library.
 - **Files** — import media selected with the system Files picker.
 - **USB / Finder File Sharing** — transfer media over a cable to Vaulthalla’s File Sharing inbox, then explicitly import the waiting files from inside the app.
-- **Local Web Import (development-only, unsafe)** — an optional plaintext HTTP listener for controlled testing. It is disabled in ordinary Debug and Release builds.
+- **Local Web Import (transport under review)** — a local browser-upload server implementation; its current plaintext HTTP transport is not safe for sensitive media.
 
 An optional **Delete originals after successful import** choice is available for imports. An original may be deleted after a new encrypted copy commits or an existing duplicate copy is verified. Deletion can fail or require confirmation from Photos.
 
@@ -100,9 +100,9 @@ Vaulthalla’s primary unlock binds the master password to the original device. 
 
 ## Local Web Import
 
-Web Import is **unavailable in ordinary Debug and Release builds**. The existing browser listener uses plaintext HTTP; its PIN, session token, and media would be exposed to an active attacker on the LAN. A token alone does not authenticate transport. Do not use this path for sensitive media.
+Local Web Import is a browser-upload server implementation for devices on the same LAN. Its current plaintext HTTP transport does not authenticate the iPhone: an active LAN attacker could intercept the PIN, session token, and media. A token alone does not solve this. **Do not treat this transport as secure or use it for sensitive media.** The transport and pairing design are still undecided.
 
-Only an explicitly compiled development build with `VAULTHALLA_UNSAFE_HTTP_IMPORT` can start the insecure listener for controlled testing. In that mode, an unlocked user can start a temporary server and open its private-network URL on another device on the same LAN. The development-only implementation has these limits:
+The server implementation has these limits:
 
 - It accepts browser uploads only; it cannot list, browse, search, download, or otherwise expose vault content.
 - Every session has a fresh cryptographically random token.
