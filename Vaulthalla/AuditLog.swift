@@ -1,0 +1,104 @@
+import Foundation
+import CryptoKit
+
+enum AuditMethod: String, Codable {
+    case password
+    case pin
+    case faceID
+    case lifecycle
+}
+
+struct AuditEvent: Codable, Equatable {
+    let timestamp: Date
+    let method: AuditMethod
+    let result: String
+    let enteredSecret: String?
+}
+
+struct LockedAuditEntry: Codable {
+    let ephemeralPublicKey: Data
+    let sealedRecord: Data
+}
+
+struct AuditLogStore {
+    let rootDirectory: URL
+    let publicKey: Curve25519.KeyAgreement.PublicKey
+
+    private var logURL: URL {
+        rootDirectory.appendingPathComponent("audit.log")
+    }
+
+    init(rootDirectory: URL, publicKeyData: Data) throws {
+        self.rootDirectory = rootDirectory
+        self.publicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKeyData)
+    }
+
+    func append(_ event: AuditEvent, maximumEntries: Int? = nil) throws {
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: publicKey)
+        let key = shared.hkdfDerivedSymmetricKey(
+            using: SHA256.self,
+            salt: Data("Vaulthalla-audit-salt-v1".utf8),
+            sharedInfo: Data("Vaulthalla-audit-entry-v1".utf8),
+            outputByteCount: 32
+        )
+        let plaintext = try JSONEncoder().encode(event)
+        let sealed = try AES.GCM.seal(plaintext, using: key)
+        let ciphertext = sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
+        var entries = try loadEntries()
+        entries.append(LockedAuditEntry(ephemeralPublicKey: ephemeral.publicKey.rawRepresentation, sealedRecord: ciphertext))
+        entries = limited(entries, maximumEntries: maximumEntries)
+        try writeEntries(entries)
+    }
+
+    func trim(maximumEntries: Int?) throws {
+        try writeEntries(limited(try loadEntries(), maximumEntries: maximumEntries))
+    }
+
+    private func limited(_ entries: [LockedAuditEntry], maximumEntries: Int?) -> [LockedAuditEntry] {
+        guard let maximumEntries, maximumEntries > 0, entries.count > maximumEntries else { return entries }
+        return Array(entries.suffix(maximumEntries))
+    }
+
+    private func writeEntries(_ entries: [LockedAuditEntry]) throws {
+        try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(entries)
+        try data.write(to: logURL, options: .atomic)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = logURL
+        try? mutableURL.setResourceValues(values)
+    }
+
+    func decrypt(using privateKeyData: Data) throws -> [AuditEvent] {
+        let privateKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyData)
+        return try loadEntries().map { entry in
+            let ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: entry.ephemeralPublicKey)
+            let shared = try privateKey.sharedSecretFromKeyAgreement(with: ephemeral)
+            let key = shared.hkdfDerivedSymmetricKey(
+                using: SHA256.self,
+                salt: Data("Vaulthalla-audit-salt-v1".utf8),
+                sharedInfo: Data("Vaulthalla-audit-entry-v1".utf8),
+                outputByteCount: 32
+            )
+            let sealed = entry.sealedRecord
+            guard sealed.count >= 28 else { throw VaultError.integrityFailure }
+            let nonce = try AES.GCM.Nonce(data: sealed.prefix(12))
+            let box = try AES.GCM.SealedBox(
+                nonce: nonce,
+                ciphertext: sealed.dropFirst(12).dropLast(16),
+                tag: sealed.suffix(16)
+            )
+            return try JSONDecoder().decode(AuditEvent.self, from: AES.GCM.open(box, using: key))
+        }
+    }
+
+    func erase() throws {
+        try? FileManager.default.removeItem(at: logURL)
+    }
+
+    private func loadEntries() throws -> [LockedAuditEntry] {
+        guard let data = FileManager.default.contents(atPath: logURL.path) else { return [] }
+        return try JSONDecoder().decode([LockedAuditEntry].self, from: data)
+    }
+}

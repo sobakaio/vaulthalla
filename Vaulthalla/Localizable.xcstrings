@@ -1,0 +1,465 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%@ of %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ of %2$@"
+          }
+        }
+      }
+    },
+    "%lld" : {
+
+    },
+    "%lld file(s) imported" : {
+
+    },
+    "%lld of %lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld of %2$lld"
+          }
+        }
+      }
+    },
+    "%lld sec" : {
+
+    },
+    "%lld selected" : {
+
+    },
+    "4–8 digit PIN" : {
+
+    },
+    "50 entries" : {
+
+    },
+    "100 entries" : {
+
+    },
+    "500 entries" : {
+
+    },
+    "A private place for your memories" : {
+
+    },
+    "After %lld failed attempts" : {
+
+    },
+    "All media in the vault will be permanently destroyed. The vault keys are erased with them. This cannot be undone." : {
+
+    },
+    "Auto-destroy after failed unlocks" : {
+
+    },
+    "Autoplay video" : {
+
+    },
+    "Cancel" : {
+
+    },
+    "Change master password" : {
+
+    },
+    "Change Password" : {
+
+    },
+    "Choose a password you can keep safe. Losing it permanently loses access to this vault." : {
+
+    },
+    "Chunk size" : {
+
+    },
+    "Compact storage" : {
+
+    },
+    "Confirm new password" : {
+
+    },
+    "Confirm password" : {
+
+    },
+    "Confirm PIN" : {
+
+    },
+    "Consider a longer password." : {
+
+    },
+    "Copied" : {
+
+    },
+    "Copy address" : {
+
+    },
+    "Counters reset after a successful unlock with the same method." : {
+
+    },
+    "Create vault" : {
+
+    },
+    "Create your vault" : {
+
+    },
+    "Creating…" : {
+
+    },
+    "Current method" : {
+
+    },
+    "Delete" : {
+
+    },
+    "Delete originals after successful import" : {
+
+    },
+    "Delete selected groups?" : {
+
+    },
+    "Delete selected media?" : {
+
+    },
+    "Destroy everything" : {
+
+    },
+    "Destroy vault" : {
+
+    },
+    "Destroy vault?" : {
+
+    },
+    "Destroying the vault permanently erases its keys and encrypted data. There is no recovery." : {
+
+    },
+    "Done" : {
+
+    },
+    "Encrypted storage is device-bound and excluded from backups. Compaction reclaims reusable encrypted space." : {
+
+    },
+    "Enter your PIN" : {
+
+    },
+    "Erase" : {
+
+    },
+    "Erase Security Activity?" : {
+
+    },
+    "Face ID failures" : {
+
+    },
+    "Face ID failures: %lld" : {
+
+    },
+    "Failed" : {
+
+    },
+    "Files travel directly to this iPhone over your local network. They are encrypted as they arrive. This page cannot view, download, or browse anything already in your vault." : {
+
+    },
+    "Fill" : {
+
+    },
+    "Fit" : {
+
+    },
+    "Generate missing previews (%lld)" : {
+
+    },
+    "Hide password" : {
+
+    },
+    "History" : {
+
+    },
+    "Image display" : {
+
+    },
+    "Image pause" : {
+
+    },
+    "Images" : {
+
+    },
+    "Import" : {
+
+    },
+    "Import paused" : {
+
+    },
+    "Imported" : {
+
+    },
+    "Importing %@" : {
+
+    },
+    "Importing…" : {
+
+    },
+    "Info" : {
+
+    },
+    "Integrity" : {
+
+    },
+    "Item %lld of %lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Item %1$lld of %2$lld"
+          }
+        }
+      }
+    },
+    "Last verified" : {
+
+    },
+    "Library" : {
+
+    },
+    "Lock vault now" : {
+
+    },
+    "Loop slideshow" : {
+
+    },
+    "Loop video" : {
+
+    },
+    "Master password" : {
+
+    },
+    "New master password" : {
+
+    },
+    "No Security Activity" : {
+
+    },
+    "OK" : {
+
+    },
+    "One password. No recovery." : {
+
+    },
+    "One-way and local only" : {
+
+    },
+    "Open this address in the other device’s browser:" : {
+
+    },
+    "Original filename" : {
+
+    },
+    "Password failures" : {
+
+    },
+    "Password strength" : {
+
+    },
+    "Passwords do not match" : {
+
+    },
+    "Pause" : {
+
+    },
+    "Photo" : {
+
+    },
+    "Physical size" : {
+
+    },
+    "PIN" : {
+
+    },
+    "PIN failures" : {
+
+    },
+    "PIN failures: %lld" : {
+
+    },
+    "PINs do not match" : {
+
+    },
+    "Playback" : {
+
+    },
+    "Preparing video" : {
+
+    },
+    "Privacy" : {
+
+    },
+    "Privacy cover" : {
+
+    },
+    "Private by design" : {
+
+    },
+    "Quick unlock" : {
+
+    },
+    "Quick unlock is protected by the device security hardware. Your master password remains the recovery-free vault credential." : {
+
+    },
+    "Resume" : {
+
+    },
+    "Reusable chunks" : {
+
+    },
+    "Save" : {
+
+    },
+    "Screenshot protection" : {
+
+    },
+    "Security Activity" : {
+
+    },
+    "Segments" : {
+
+    },
+    "Select all" : {
+
+    },
+    "Send photos and videos from another device on the same Wi‑Fi network." : {
+
+    },
+    "Session expires in 15 minutes" : {
+
+    },
+    "Set up PIN" : {
+
+    },
+    "Size" : {
+
+    },
+    "Slideshow" : {
+
+    },
+    "Stop Web Import" : {
+
+    },
+    "Storage" : {
+
+    },
+    "Strength is advice, not a requirement." : {
+
+    },
+    "Success" : {
+
+    },
+    "This is off by default. When enabled, the vault keys are destroyed after the threshold is reached." : {
+
+    },
+    "Turn off convenience unlock" : {
+
+    },
+    "Type" : {
+
+    },
+    "Unlimited" : {
+
+    },
+    "Unlock" : {
+
+    },
+    "Unlock policy" : {
+
+    },
+    "Unlock statistics" : {
+
+    },
+    "Unlock with Face ID" : {
+
+    },
+    "Unlock with password" : {
+
+    },
+    "Unlock with PIN" : {
+
+    },
+    "Unlocking your private library…" : {
+
+    },
+    "Unlocking…" : {
+
+    },
+    "Use Face ID" : {
+
+    },
+    "Use PIN" : {
+
+    },
+    "Use this only on a device you trust." : {
+
+    },
+    "Used capacity" : {
+
+    },
+    "Vault" : {
+
+    },
+    "Vault capacity" : {
+
+    },
+    "Vault destroyed" : {
+
+    },
+    "Vault message" : {
+
+    },
+    "Vaulthalla" : {
+
+    },
+    "Vaulthalla covers sensitive screens when the app leaves the foreground, locks the vault in the background, and — when screenshot protection is on — covers the screen and locks on screenshots or screen recordings." : {
+
+    },
+    "Vaulthalla encrypts your library on this device. No account, no cloud, no recovery shortcut." : {
+
+    },
+    "Verify vault" : {
+
+    },
+    "Video" : {
+
+    },
+    "Video display" : {
+
+    },
+    "Video position" : {
+
+    },
+    "Videos" : {
+
+    },
+    "Web Import" : {
+
+    },
+    "Welcome back" : {
+
+    },
+    "Working…" : {
+
+    },
+    "You can change storage maintenance options later in Settings." : {
+
+    },
+    "Your media stays byte-for-byte unchanged while its encrypted copy is stored inside the vault." : {
+
+    },
+    "Your private library is protected and ready when you are." : {
+
+    },
+    "Your vault never leaves this device." : {
+
+    }
+  },
+  "version" : "1.0"
+}
