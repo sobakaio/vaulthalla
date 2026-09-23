@@ -29,14 +29,14 @@ The vault is deliberately **one-way**: it does not offer export, sharing, Save t
 
 ### Import media your way
 
-Vaulthalla supports four user-controlled import paths:
+Vaulthalla provides three import paths in normal builds. A fourth, Local Web Import, is present only for controlled development testing:
 
 - **Photos** — select images and videos from the iPhone photo library.
 - **Files** — import media selected with the system Files picker.
 - **USB / Finder File Sharing** — transfer media over a cable to Vaulthalla’s File Sharing inbox, then explicitly import the waiting files from inside the app.
-- **Local Web Import** — start a temporary local web server, then upload from a browser on another device connected to the same LAN.
+- **Local Web Import (development-only, unsafe)** — an optional plaintext HTTP listener for controlled testing. It is disabled in ordinary Debug and Release builds.
 
-An optional **Delete originals after successful import** choice is available for imports. An original is considered for deletion only after its encrypted vault copy has committed successfully.
+An optional **Delete originals after successful import** choice is available for imports. An original may be deleted after a new encrypted copy commits or an existing duplicate copy is verified. Deletion can fail or require confirmation from Photos.
 
 Imports stream data rather than loading a large video all at once. Original media bytes are retained unchanged, and SHA-256 duplicate detection avoids storing the same source twice—even when it has a different name. The app reports imported, duplicate, failed, and retained-source results after an import.
 
@@ -53,17 +53,17 @@ Imports stream data rather than loading a large video all at once. Original medi
 
 ## Security by design
 
-Vaulthalla is built around the principle that the vault should be useless without both the user’s password and the original device.
+Vaulthalla’s primary unlock binds the master password to the original device. Optional on-device PIN or Face ID wrappers provide alternate convenience unlock after setup.
 
 | Security property | How Vaulthalla applies it |
 | --- | --- |
 | **Offline by default** | No account, cloud sync, telemetry, analytics, or remote vault access. |
-| **Two-part unlock** | The vault needs the master password and a device-only Keychain secret. |
+| **Device-bound primary unlock** | Master-password unlock combines the password with a device-only Keychain secret; optional PIN/Face ID wrappers are separate on-device unlock paths. |
 | **Authenticated encryption** | AES-GCM protects encrypted media, metadata, thumbnails, and structural integrity. |
 | **Independent media keys** | Every imported item has its own random 256-bit key. |
 | **Minimal lock-screen leakage** | Vault contents, counts, storage, groups, and activity stay hidden until unlock. |
 | **One-way vault** | No export, sharing, Save to Photos, or Save to Files from the vault. |
-| **Fail closed** | Verification reports corrupted data; it does not silently repair or delete it. |
+| **Integrity response** | Chunk verification reports corruption without silently repairing media. Confirmed, unrecoverable vault/key mismatch triggers resumable destruction; transient I/O or Keychain errors block access without wiping. |
 
 ### Device-bound encryption
 
@@ -94,19 +94,19 @@ Vaulthalla is built around the principle that the vault should be useless withou
 - Password unlock is always available. Optional PIN and Face ID convenience unlock can be enabled on the device.
 - Failed unlocks are rate-limited with increasing delays.
 - An optional auto-destroy policy can destroy vault keys and remove the vault after a configured number of failed password attempts.
-- The app locks when it leaves the foreground. Screenshot and screen-recording protection can cover the interface and lock the vault when capture is detected.
+- The app locks when it leaves the foreground. Optional screenshot and screen-recording protection obscures the interface and can lock on capture detection; it cannot guarantee prevention of OS or external-camera captures.
 - An opaque privacy cover protects the App Switcher preview.
-- Security Activity is encrypted and available only after the vault is unlocked.
+- Security Activity is optional and **off by default**. When enabled, its encrypted history is visible only after unlock and records time, unlock method, and result—not entered passwords or PINs. Turning it off clears the current history and rotates its key.
 
 ## Local Web Import
 
-Web Import is a convenience transfer feature, not remote access or synchronization.
+Web Import is **unavailable in ordinary Debug and Release builds**. The existing browser listener uses plaintext HTTP; its PIN, session token, and media would be exposed to an active attacker on the LAN. A token alone does not authenticate transport. Do not use this path for sensitive media.
 
-When an unlocked user explicitly starts it, Vaulthalla runs a temporary local web server and shows a private-network URL. Open that URL in a browser on **another device connected to the same LAN** to upload media directly into the vault. Its design is intentionally narrow:
+Only an explicitly compiled development build with `VAULTHALLA_UNSAFE_HTTP_IMPORT` can start the insecure listener for controlled testing. In that mode, an unlocked user can start a temporary server and open its private-network URL on another device on the same LAN. The development-only implementation has these limits:
 
 - It accepts browser uploads only; it cannot list, browse, search, download, or otherwise expose vault content.
 - Every session has a fresh cryptographically random token.
-- Only the import page and authenticated upload route are accepted.
+- Only the import page and token-gated upload route are accepted; the token does not protect against interception over HTTP.
 - Uploads stream directly into encrypted storage rather than being staged as plaintext files.
 - The listener stops when the user stops it, the vault locks, the app backgrounds, or the session expires.
 
@@ -124,9 +124,11 @@ Long imports and maintenance tasks are transactional and can use best-effort con
 
 Vaulthalla has no password recovery, recovery phrase, reset path, or cloud recovery. Losing the master password, the device-binding secret, the app container, or the device can make the vault permanently inaccessible.
 
-Vault data, encrypted audit data, and app-managed import staging are excluded from device backups. Keychain material is device-only and does not migrate to another device.
+Current vault, audit, and app-managed staging files are marked to be excluded from device backups. This does not prove that older backups, snapshots, or physical flash copies were erased. Keychain vault material is device-only and does not migrate to another device.
 
-Deleting an item destroys its active key and removes it from the vault state. As with all flash storage, Vaulthalla does not claim guaranteed physical overwrite of every historical byte.
+Deleting an item removes its active key from the current encrypted index and removes it from the vault state. Vaulthalla does not claim guaranteed physical overwrite of historical bytes, snapshots, or backups.
+
+Video playback can create a full decrypted copy in a temporary file marked `NSFileProtectionComplete`. The app removes it when playback ends and sweeps leftovers on a later launch after a crash; physical erasure is not guaranteed.
 
 The USB/Finder inbox is an intentional plaintext staging area until the user imports or removes its files. Photos and Files imports may ask Apple’s system pickers to retrieve media the user explicitly selects, including from iCloud-backed libraries or drives. Those system-managed transfers are separate from Vaulthalla’s normal local-only vault behavior.
 
