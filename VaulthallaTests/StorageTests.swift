@@ -1,5 +1,7 @@
 import Testing
 import Foundation
+import UIKit
+import AVFoundation
 import CryptoKit
 import Security
 @testable import Vaulthalla
@@ -215,12 +217,8 @@ struct StorageTests {
         #expect(first?.id == second?.id)
         #expect((await store.snapshot()).records.count == 1)
     }
-    @Test func streamedVideoFileProducesPosterPreview() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        let encoded = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAPBbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAA"
+private static let videoFixtureBase64 =
+        "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAPBbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAA"
             + "AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAA"
             + "Aux0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA"
             + "AAAAAAAAAAAAAABAAAAAAGAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAIAAABAAAAAAJkbWRpYQAAACBtZGhk"
@@ -246,12 +244,23 @@ struct StorageTests {
             + "5SXikwyt23GKfyKU7Q+8+C0DrjXOsQAAAAtBmiRsQQ/+qlUeUAAAAAhBnkJ4hv8C7wAAAAgBnmF0Qz8DVgAAAAgBnmNqQz8DVwAA"
             + "ABFBmmhJqEFomUwIf//+qZZaQQAAAApBnoZFESw3/wLvAAAACAGepXRDPwNXAAAACAGep2pDPwNWAAAAEEGaq0moQWyZTAhn//6e"
             + "EfsAAAAKQZ7JRRUsN/8C7wAAAAgBnupqQz8DVg=="
-        guard let videoBytes = Data(base64Encoded: encoded) else {
-            Issue.record("The embedded H.264 fixture is invalid.")
-            return
+
+    private static func makeVideoFixture(at directory: URL) throws -> URL {
+        guard let videoBytes = Data(base64Encoded: Self.videoFixtureBase64) else {
+            fatalError("The embedded H.264 fixture is invalid.")
         }
         let source = directory.appendingPathComponent("poster-fixture.mp4")
         try videoBytes.write(to: source)
+        return source
+    }
+
+    /// AUDIT #13: a video poster must be produced by streaming bounded byte
+    /// ranges through the in-memory resource loader — no plaintext on disk.
+    @Test func streamedVideoFileProducesPosterPreview() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let source = try Self.makeVideoFixture(at: directory)
 
         let store = EncryptedBlockStore(rootDirectory: directory.appendingPathComponent("vault", isDirectory: true))
         let rootKey = SymmetricKey(size: .bits256)
@@ -266,11 +275,72 @@ struct StorageTests {
             return
         }
 
-        let protectedURL = directory.appendingPathComponent("vaultthumb-fixture.mp4")
-        try await store.writePlaintext(for: record, to: protectedURL)
-        defer { try? FileManager.default.removeItem(at: protectedURL) }
-        let poster = await ThumbnailGenerator.fromURL(protectedURL, isVideo: true)
+        let provider = VaultVideoAssetProvider(
+            mimeType: record.mimeType,
+            byteCount: record.byteCount
+        ) { offset, length in
+            try await store.plaintext(for: record, byteRange: offset..<(offset + length))
+        }
+        let poster = await ThumbnailGenerator.fromVideoAsset(provider: provider, record: record, rootKey: rootKey)
         #expect(poster != nil)
+        #expect(UIImage(data: poster ?? Data()) != nil)
+
+        // AUDIT #13: no temporary plaintext file may be created for this vault
+        // directory (the loader serves bytes in memory).
+        let vaultDir = directory.appendingPathComponent("vault", isDirectory: true)
+        let vaultFiles = (try? FileManager.default.contentsOfDirectory(at: vaultDir, includingPropertiesForKeys: nil)) ?? []
+        #expect(!vaultFiles.contains {
+            $0.lastPathComponent.hasPrefix("vaultplay-") || $0.lastPathComponent.hasPrefix("vaultthumb-")
+        })
+    }
+
+    /// The resource loader must serve byte ranges that exactly match the
+    /// original file, including a clamped tail past EOF and an empty range.
+    @Test func inMemoryVideoAssetServesExactByteRanges() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let source = try Self.makeVideoFixture(at: directory)
+        let original = try Data(contentsOf: source)
+
+        let store = EncryptedBlockStore(rootDirectory: directory.appendingPathComponent("vault", isDirectory: true))
+        let rootKey = SymmetricKey(size: .bits256)
+        guard let record = try await store.importFile(
+            at: source,
+            filename: source.lastPathComponent,
+            mimeType: "video/mp4",
+            rootKey: rootKey,
+            segmentCapacity: SegmentCapacity.megabytes50.bytes
+        ) else {
+            Issue.record("Video import did not return a media record.")
+            return
+        }
+
+        // Whole file, one range.
+        let whole = try await store.plaintext(for: record, byteRange: 0..<Int64(original.count))
+        #expect(whole == original)
+
+        // Two chunks covering the whole file (the fixture straddles the chunk boundary).
+        let mid = Int64(original.count / 2)
+        let first = try await store.plaintext(for: record, byteRange: 0..<mid)
+        let last = try await store.plaintext(for: record, byteRange: mid..<Int64(original.count))
+        #expect(first + last == original)
+
+        // A range past EOF is a hard integrity failure at the store level;
+        // the asset provider clamps before it ever reaches this API.
+        do {
+            _ = try await store.plaintext(
+                for: record,
+                byteRange: (Int64(original.count) - 8)..<Int64(original.count + 4096)
+            )
+            Issue.record("Out-of-range read must throw.")
+        } catch {
+            #expect(error is VaultError)
+        }
+
+        // An empty range is a legal no-op.
+        let empty = try await store.plaintext(for: record, byteRange: mid..<mid)
+        #expect(empty.isEmpty)
     }
 
 }

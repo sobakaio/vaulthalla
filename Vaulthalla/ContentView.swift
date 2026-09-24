@@ -1041,11 +1041,10 @@ final class VaultAppModel {
 
         let jpeg: Data?
         if isVideo {
-            // Decrypt to a protected temporary file a chunk at a time. This avoids
-            // holding a whole movie in memory just to render its poster.
-            guard let url = try? await store.writeMediaToProtectedTemporaryFile(record, using: rootKey) else { return nil }
-            defer { try? FileManager.default.removeItem(at: url) }
-            jpeg = await ThumbnailGenerator.fromURL(url, isVideo: true)
+            // Decode the first frame through an in-memory resource loader;
+            // decrypted bytes never reach disk.
+            let provider = VaultVideoPlayerModel.makeProvider(for: record, rootKey: rootKey)
+            jpeg = await ThumbnailGenerator.fromVideoAsset(provider: provider, record: record, rootKey: rootKey)
         } else if let full = try? await store.readMedia(record, using: rootKey) {
             jpeg = await ThumbnailGenerator.fromImageData(full)
         } else {
@@ -3423,8 +3422,9 @@ struct MediaViewer: View {
         }
     }
 
-    /// Decrypt and build one adjacent player ahead of time, without playing it.
-    /// Its protected file remains owned by the model until consumed or discarded.
+    /// Decode and build one adjacent player ahead of time, without playing it.
+    /// The in-memory asset and its resource loader stay owned by the model
+    /// until consumed or discarded.
     private func preloadNextVideo() {
         discardPreloadedVideo()
         let next = currentIndex + 1
@@ -3434,22 +3434,15 @@ struct MediaViewer: View {
         let nextRecord = items[next]
         prefetchedVideoID = nextRecord.id
         preloadTask = Task {
-            do {
-                let url = try await VaultStore.shared.writeMediaToProtectedTemporaryFile(
-                    nextRecord, using: rootKey, prefix: VaultVideoPlayerModel.tempFilePrefix
-                )
-                guard !Task.isCancelled, prefetchedVideoID == nextRecord.id else {
-                    try? FileManager.default.removeItem(at: url)
-                    return nil
-                }
-                let playback = VaultVideoPlayerModel()
-                playback.prepareProtectedFile(at: url, loops: videoLoop && !slideshowActive)
-                // AVPlayerItem is built ahead of the swipe, but playback stays paused.
-                prefetchedPlayback = playback
-                return playback
-            } catch {
+            let playback = VaultVideoPlayerModel()
+            await playback.prepare(record: nextRecord, rootKey: rootKey, loops: videoLoop && !slideshowActive)
+            guard playback.player != nil, !Task.isCancelled, prefetchedVideoID == nextRecord.id else {
+                playback.stop()
                 return nil
             }
+            // AVPlayerItem is built ahead of the swipe, but playback stays paused.
+            prefetchedPlayback = playback
+            return playback
         }
     }
 

@@ -519,22 +519,7 @@ actor VaultStore {
         _ = try fileManager.replaceItemAt(headerURL, withItemAt: temporaryURL)
     }
 
-    /// Creates a short-lived, protected file for AVFoundation poster extraction.
-    /// The block store authenticates each chunk and the complete media digest.
-    func writeMediaToProtectedTemporaryFile(
-        _ record: MediaRecord,
-        using rootKey: SymmetricKey,
-        prefix: String = "vaultthumb-"
-    ) async throws -> URL {
-        try await blockStore.load(using: rootKey)
-        let fileExtension = (record.filename as NSString).pathExtension
-        let suffix = fileExtension.isEmpty ? "" : ".\(fileExtension)"
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(prefix)\(UUID().uuidString)\(suffix)")
-        try await blockStore.writePlaintext(for: record, to: url)
-        return url
-    }
-
+    /// Returns the full authenticated plaintext of a media record.
     func readMedia(_ record: MediaRecord, using rootKey: SymmetricKey) async throws -> Data {
         try await blockStore.load(using: rootKey)
         return try await blockStore.plaintext(for: record)

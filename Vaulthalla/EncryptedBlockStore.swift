@@ -324,6 +324,8 @@ actor EncryptedBlockStore {
     /// Writes authenticated plaintext to a complete-protection temporary file
     /// without buffering an entire large media item in memory. The caller must
     /// remove the file as soon as it has finished deriving its preview.
+    /// NOTE: the app no longer calls this in normal operation (AUDIT #13 — media
+    /// is served in memory); it remains for tests and the import-boundary tooling.
     func writePlaintext(for record: MediaRecord, to url: URL) throws {
         guard !accessRevoked else { throw CancellationError() }
         guard record.byteCount >= 0,
