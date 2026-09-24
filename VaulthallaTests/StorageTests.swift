@@ -531,4 +531,51 @@ private static let videoFixtureBase64 =
             _ = try KeychainStore.loadDeviceSecret(account: scope.account, service: scope.service)
         }
     }
+
+    // MARK: - AUDIT #10 — protected-file attribute read-back (hardware)
+
+    /// AUDIT #10: every sensitive vault file must be excluded from backup, and
+    /// (on real hardware) report a Complete or Complete-Until-First-Auth Data
+    /// Protection class. Simulator filesystems do not report NSFileProtectionKey
+    /// reliably, so the protection-class assertion is hardware-only; the backup
+    /// exclusion is asserted everywhere.
+    @Test func vaultFilesReportExpectedProtectionAndBackupPolicy() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        let store = scope.makeStore()
+        let password = "long-creation-test-password"
+        try await store.createVault(password: password, segmentCapacity: .megabytes50)
+        let rootKey = try await store.unlock(password: password)
+
+        // Two media items force at least one segment file; the header and
+        // index already exist after creation.
+        for i in 0..<2 {
+            let payload = Data((0..<200_000).map { _ in UInt8.random(in: 0...255) })
+            let srcURL = scope.directory.appendingPathComponent("source-\(i).bin")
+            try payload.write(to: srcURL)
+            _ = try await store.importFile(at: srcURL, rootKey: rootKey)
+            try FileManager.default.removeItem(at: srcURL)
+        }
+
+        let vault = scope.vaultDirectory()
+        let names = try FileManager.default.contentsOfDirectory(atPath: vault.path)
+        #expect(names.contains("vault.header"))
+        #expect(names.contains("index.v1"))
+        let segmentCount = names.filter { $0.hasPrefix("segment-") && $0.hasSuffix(".dat") }.count
+        #expect(segmentCount >= 1)
+        for name in names {
+            let url = vault.appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+                  !isDir.boolValue else { continue }
+            #if !targetEnvironment(simulator)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let protection = attributes[.protectionKey] as? FileProtectionType
+            #expect(protection == .complete || protection == .completeUntilFirstUserAuthentication,
+                   "\(name) reports unexpected protection class \(String(describing: protection))")
+            #endif
+            let excluded = (try? url.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup
+            #expect(excluded == true, "\(name) is not excluded from backup")
+        }
+    }
 }

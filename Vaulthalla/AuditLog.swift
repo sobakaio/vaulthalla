@@ -75,6 +75,15 @@ struct AuditLogStore {
         values.isExcludedFromBackup = true
         var mutableURL = temporary
         try mutableURL.setResourceValues(values)
+        // AUDIT #10: verify the protection/backup policy actually took effect
+        // before the log is published; never write an unverified audit file.
+        let attrs = try FileManager.default.attributesOfItem(atPath: temporary.path)
+        #if !targetEnvironment(simulator)
+        guard attrs[.protectionKey] as? FileProtectionType == .complete else { throw VaultError.storageFailure }
+        #endif
+        guard (try? temporary.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup == true else {
+            throw VaultError.storageFailure
+        }
         if FileManager.default.fileExists(atPath: logURL.path) {
             _ = try FileManager.default.replaceItemAt(logURL, withItemAt: temporary)
         } else {

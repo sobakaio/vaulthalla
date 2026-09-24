@@ -590,9 +590,28 @@ actor EncryptedBlockStore {
         return urls.filter { $0.lastPathComponent.hasPrefix(segmentURLPrefix) && $0.pathExtension == "dat" }.count
     }
 
+    /// Sets Complete-Until-First-Auth Data Protection and backup exclusion,
+    /// then verifies both actually took effect (AUDIT #10). A sensitive vault
+    /// file that cannot report the expected policy is surfaced as a failure,
+    /// never silently written.
     func protectAndExclude(_ url: URL) throws {
         try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
         try excludeFromBackup(url)
+        try verifyProtectionAndExclusion(of: url)
+    }
+
+    func verifyProtectionAndExclusion(of url: URL) throws {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        #if !targetEnvironment(simulator)
+        // Simulator filesystems do not report NSFileProtectionKey reliably;
+        // the attribute is still set on creation, and this is verified on hardware.
+        guard attributes[.protectionKey] as? FileProtectionType == .completeUntilFirstUserAuthentication else {
+            throw VaultError.storageFailure
+        }
+        #endif
+        guard (try? url.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup == true else {
+            throw VaultError.storageFailure
+        }
     }
 
     func excludeFromBackup(_ url: URL) throws {
