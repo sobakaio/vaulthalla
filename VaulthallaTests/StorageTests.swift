@@ -578,4 +578,83 @@ private static let videoFixtureBase64 =
             #expect(excluded == true, "\(name) is not excluded from backup")
         }
     }
+
+    // MARK: - AUDIT #11 — destruction verifies deletion; key destruction is irreversible
+
+    /// AUDIT #11: a successful destruction must have actually removed the
+    /// vault directory AND destroyed the device key, so that even leftover
+    /// ciphertext is unrecoverable (the root key derives from the device
+    /// secret). This is the provable core of the destruction guarantee; the
+    /// physical flash bits are explicitly out of scope (unprovable).
+    @Test func destructionVerifiesRemovalAndIrreversibleKeyDestruction() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        let store = scope.makeStore()
+        let password = "long-creation-test-password"
+        try await store.createVault(password: password, segmentCapacity: .megabytes50)
+        let rootKey = try await store.unlock(password: password)
+        // One media item so a segment file exists alongside header + index.
+        let payload = Data((0..<120_000).map { _ in UInt8.random(in: 0...255) })
+        let srcURL = scope.directory.appendingPathComponent("source.bin")
+        try payload.write(to: srcURL)
+        _ = try await store.importFile(at: srcURL, rootKey: rootKey)
+        try FileManager.default.removeItem(at: srcURL)
+
+        let vault = scope.vaultDirectory()
+        #expect(FileManager.default.fileExists(atPath: vault.path))
+        try await store.destroyVault()
+
+        // Filesystem deletion is verified, not assumed.
+        #expect(!FileManager.default.fileExists(atPath: vault.path))
+        // The device key is gone: the root key can no longer be re-derived, so
+        // any surviving ciphertext is unrecoverable by design.
+        await #expect(throws: VaultError.keychainFailure(errSecItemNotFound)) {
+            _ = try KeychainStore.loadDeviceSecret(account: scope.account, service: scope.service)
+        }
+    }
+
+    /// AUDIT #11: a failed filesystem deletion must be surfaced as an error,
+    /// never reported as success. With removal forced to fail, `destroyVault`
+    /// throws and the vault directory is still present (no false onboarding).
+    @Test func failedDestructionIsSurfacedNotReportedAsSuccess() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        let failingStore = VaultStore(
+            fileManager: FailingRemoveFileManager(replacement: scope.directory),
+            deviceSecretAccount: scope.account,
+            deviceSecretService: scope.service)
+        let password = "long-creation-test-password"
+        try await failingStore.createVault(password: password, segmentCapacity: .megabytes50)
+        let vault = scope.vaultDirectory()
+        #expect(FileManager.default.fileExists(atPath: vault.path))
+        await #expect(throws: VaultError.storageFailure.self) {
+            try await failingStore.destroyVault()
+        }
+        // The deletion failed and was surfaced: the directory must still be
+        // present so a retry on next launch can finish the cleanup.
+        #expect(FileManager.default.fileExists(atPath: vault.path))
+    }
+}
+
+/// A redirected file manager whose `removeItem` always fails, to simulate an
+/// interrupted/failed filesystem deletion during destruction (AUDIT #11).
+private final class FailingRemoveFileManager: FileManager {
+    private let inner: RedirectedFileManager
+    init(replacement: URL) {
+        self.inner = RedirectedFileManager(replacement: replacement)
+        super.init()
+    }
+    required init(contentsOf fileURL: URL) throws {
+        self.inner = RedirectedFileManager(replacement: fileURL)
+        super.init()
+    }
+    override func urls(for directory: SearchPathDirectory, in domainMask: SearchPathDomainMask) -> [URL] {
+        inner.urls(for: directory, in: domainMask)
+    }
+    override func removeItem(atPath path: String) throws {
+        throw VaultError.storageFailure
+    }
+    override func removeItem(at url: URL) throws {
+        throw VaultError.storageFailure
+    }
 }
