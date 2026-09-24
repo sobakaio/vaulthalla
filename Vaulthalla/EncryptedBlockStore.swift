@@ -6,8 +6,17 @@ actor EncryptedBlockStore {
     private let fileManager: FileManager
     enum CompactionBoundary: CaseIterable {
         case write, sync, replace, cleanup
+        /// Power cut after some bytes of a new chunk reached the new segment.
+        case partialChunk
+        /// Power cut after the replacement index is staged+synced but before
+        /// the atomic rename publishes it.
+        case afterIndexStaged
     }
     private let compactionFault: ((CompactionBoundary) throws -> Void)?
+    /// Test hook (AUDIT #2): invoked with the exact bytes about to be appended
+    /// to a new segment, right before the `.partialChunk`/`.write` boundary.
+    /// Used to simulate a power cut mid-append. Nil in production.
+    private let partialChunkHook: ((ChunkAddress, Data) -> Void)?
     private(set) var index = VaultIndex()
     private var accessGeneration: UInt64 = 0
     private var accessRevoked = false
@@ -27,10 +36,12 @@ actor EncryptedBlockStore {
     private var slotSize: Int { VaultConstants.chunkPayloadSize + 12 + 16 }
 
     init(rootDirectory: URL, fileManager: FileManager = .default,
-         compactionFault: ((CompactionBoundary) throws -> Void)? = nil) {
+         compactionFault: ((CompactionBoundary) throws -> Void)? = nil,
+         partialChunkHook: ((ChunkAddress, Data) -> Void)? = nil) {
         self.rootDirectory = rootDirectory
         self.fileManager = fileManager
         self.compactionFault = compactionFault
+        self.partialChunkHook = partialChunkHook
     }
 
     func initialize(using rootKey: SymmetricKey, auditPrivateKey: Data) throws {
@@ -81,6 +92,7 @@ actor EncryptedBlockStore {
         let temporaryHandle = try FileHandle(forWritingTo: temporary)
         try temporaryHandle.synchronize()
         try temporaryHandle.close()
+        try compactionFault?(.afterIndexStaged)
         if fileManager.fileExists(atPath: indexURL.path) {
             _ = try fileManager.replaceItemAt(indexURL, withItemAt: temporary)
         } else {
@@ -489,8 +501,11 @@ actor EncryptedBlockStore {
                     let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: physical.dropFirst(12).dropLast(16), tag: physical.suffix(16))
                     let clear = try AES.GCM.open(box, using: chunkKey, authenticating: Data("Vaulthalla-chunk-v1|\(source.segment)|\(source.slot)".utf8))
                     let sealed = try AES.GCM.seal(clear, using: chunkKey, nonce: nonce, authenticating: Data("Vaulthalla-chunk-v1|\(destination.segment)|\(destination.slot)".utf8))
+                    let chunkBytes = nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag
+                    partialChunkHook?(destination, chunkBytes)
+                    try compactionFault?(.partialChunk)
                     try compactionFault?(.write)
-                    try appendEncryptedChunk(nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag, address: destination)
+                    try appendEncryptedChunk(chunkBytes, address: destination)
                     record.chunks[ordinal] = destination
                     replacement.nextSlotBySegment[destination.segment] = destination.slot + 1
                     moved += 1

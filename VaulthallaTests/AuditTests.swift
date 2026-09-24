@@ -314,4 +314,46 @@ struct AuditTests {
         try store.trim(maximumEntries: 2)
         #expect(try store.decrypt(using: privateKey.rawRepresentation).map(\.result) == ["1", "2"])
     }
+
+    // MARK: - AUDIT #12 — a physical write fault on the audit log must surface,
+    // never be swallowed, and must not corrupt the previously published log.
+
+    /// A FileManager whose protection/backup attribute write always fails,
+    /// to simulate an I/O fault at the durability boundary of an audit-log
+    /// rewrite (AUDIT #12 "file-sync faults"). The temp file has already been
+    /// staged, so a fault here must surface and leave the published log intact.
+    private final class FailingAttributesFileManager: FileManager {
+        override func setAttributes(_ attributes: [FileAttributeKey: Any], ofItemAtPath path: String) throws {
+            throw VaultError.storageFailure
+        }
+    }
+
+    @Test func auditLogPublishFaultSurfacesAndPreservesPreviousLog() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+
+        // Publish a known entry with a healthy store first.
+        let healthy = try AuditLogStore(rootDirectory: directory, publicKeyData: privateKey.publicKey.rawRepresentation)
+        try healthy.append(AuditEvent(timestamp: Date(timeIntervalSince1970: 1), method: .password, result: "ok", enteredSecret: nil))
+        let before = try healthy.decrypt(using: privateKey.rawRepresentation)
+        #expect(before.count == 1)
+
+        // Now an attribute/durability fault: the append must throw, and the
+        // existing log must remain exactly what it was (no truncation, no
+        // partial publish of an unprotected file).
+        var faulted = try AuditLogStore(rootDirectory: directory, publicKeyData: privateKey.publicKey.rawRepresentation)
+        faulted.fileManager = FailingAttributesFileManager()
+        let threw: Bool
+        do {
+            _ = try faulted.append(AuditEvent(timestamp: Date(timeIntervalSince1970: 2), method: .password, result: "should-not-land", enteredSecret: nil))
+            threw = false
+        } catch {
+            threw = true
+        }
+        #expect(threw, "a failed audit-log durability write must surface as an error, not be swallowed")
+
+        let after = try AuditLogStore(rootDirectory: directory, publicKeyData: privateKey.publicKey.rawRepresentation).decrypt(using: privateKey.rawRepresentation)
+        #expect(after == before, "the previously published audit log must be intact after a failed durability write")
+    }
 }

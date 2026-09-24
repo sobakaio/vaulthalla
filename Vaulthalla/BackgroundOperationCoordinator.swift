@@ -8,8 +8,13 @@ final class BackgroundOperationCoordinator {
     private var activeOperation: Task<Void, Never>?
     private var queued: [@MainActor () async -> Bool] = []
     private var generation = 0
+    /// Injectable so tests can observe background requests without touching
+    /// the real BGTaskScheduler (AUDIT #12).
+    var requestSubmitter: @MainActor (BGContinuedProcessingTaskRequest) -> Void = {
+        try? BGTaskScheduler.shared.submit($0)
+    }
 
-    private init() {}
+    init() {}
 
     func register() {
         guard #available(iOS 26.0, *) else { return }
@@ -35,7 +40,7 @@ final class BackgroundOperationCoordinator {
             identifier: Self.taskIdentifier, title: title, subtitle: subtitle
         )
         request.strategy = .queue
-        try? BGTaskScheduler.shared.submit(request)
+        requestSubmitter(request)
     }
 
     private func startNext() {
@@ -68,6 +73,11 @@ final class BackgroundOperationCoordinator {
         }
     }
 
+    #if DEBUG
+    /// Test seam (AUDIT #12): true when no operation is active or queued.
+    var isIdleForTests: Bool { activeOperation == nil && queued.isEmpty }
+    func waitUntilIdleForTests() async { await waitUntilIdle() }
+    #endif
 }
 
 /// Keeps the app alive in the background for the duration of a Web Import

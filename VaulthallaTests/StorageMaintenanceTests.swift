@@ -204,9 +204,23 @@ struct StorageMaintenanceTests {
         let initial = EncryptedBlockStore(rootDirectory: vault)
         let record = try #require(await initial.importFile(at: source, filename: "source.bin", mimeType: "application/octet-stream", rootKey: key, segmentCapacity: 3_000_000))
         let original = try #require((await initial.snapshot()).records[record.id])
+        // AUDIT #2: for the `.partialChunk` boundary, physically write only half
+        // a chunk to the new segment before the fault fires, to simulate a real
+        // power cut mid-append.
+        let partialHook: ((ChunkAddress, Data) -> Void)? = boundary == .partialChunk ? { address, data in
+            let url = vault.appendingPathComponent("segment-\(address.segment).dat")
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            guard let handle = try? FileHandle(forUpdating: url) else { return }
+            defer { try? handle.close() }
+            let slot = VaultConstants.chunkPayloadSize + 28
+            try? handle.seek(toOffset: UInt64(address.slot) * UInt64(slot))
+            try? handle.write(contentsOf: data.prefix(data.count / 2))
+        } : nil
         let faulted = EncryptedBlockStore(rootDirectory: vault, compactionFault: { point in
             if point == boundary { throw InjectedFault() }
-        })
+        }, partialChunkHook: partialHook)
         try await faulted.load(using: key)
         if boundary == .cleanup {
             _ = try await faulted.compact(using: key, segmentCapacity: 3_000_000)
@@ -228,6 +242,20 @@ struct StorageMaintenanceTests {
             #expect(FileManager.default.fileExists(atPath: vault.appendingPathComponent("segment-0.dat").path))
         } else {
             #expect(persisted.chunks == original.chunks)
+        }
+        if boundary == .partialChunk {
+            // The simulated partial write must have physically reached the
+            // unreferenced new segment; the old index must not point to it.
+            let orphan = vault.appendingPathComponent("segment-1.dat")
+            #expect(FileManager.default.fileExists(atPath: orphan.path))
+            let allChunks = (await reopened.snapshot()).records.values.flatMap { $0.chunks.map(\.segment) }
+            #expect(!allChunks.contains(1), "old index must not reference the partial segment")
+        }
+        if boundary == .afterIndexStaged {
+            // The staged replacement index exists but is unpublished; the old
+            // index file must be untouched and authoritative.
+            #expect(FileManager.default.fileExists(atPath: vault.appendingPathComponent("index.v1.tmp").path))
+            #expect(FileManager.default.fileExists(atPath: vault.appendingPathComponent("index.v1").path))
         }
     }
 

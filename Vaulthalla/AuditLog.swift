@@ -27,6 +27,8 @@ struct LockedAuditEntry: Codable {
 struct AuditLogStore {
     let rootDirectory: URL
     let publicKey: Curve25519.KeyAgreement.PublicKey
+    /// Injectable so tests can simulate physical write failures (AUDIT #12).
+    var fileManager: FileManager = .default
 
     private var logURL: URL {
         rootDirectory.appendingPathComponent("audit.log")
@@ -66,28 +68,28 @@ struct AuditLogStore {
     }
 
     private func writeEntries(_ entries: [LockedAuditEntry]) throws {
-        try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(entries)
         let temporary = logURL.appendingPathExtension("tmp")
         try data.write(to: temporary, options: .atomic)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: temporary.path)
+        try fileManager.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: temporary.path)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         var mutableURL = temporary
         try mutableURL.setResourceValues(values)
         // AUDIT #10: verify the protection/backup policy actually took effect
         // before the log is published; never write an unverified audit file.
-        let attrs = try FileManager.default.attributesOfItem(atPath: temporary.path)
+        let attrs = try fileManager.attributesOfItem(atPath: temporary.path)
         #if !targetEnvironment(simulator)
         guard attrs[.protectionKey] as? FileProtectionType == .complete else { throw VaultError.storageFailure }
         #endif
         guard (try? temporary.resourceValues(forKeys: [.isExcludedFromBackupKey]))?.isExcludedFromBackup == true else {
             throw VaultError.storageFailure
         }
-        if FileManager.default.fileExists(atPath: logURL.path) {
-            _ = try FileManager.default.replaceItemAt(logURL, withItemAt: temporary)
+        if fileManager.fileExists(atPath: logURL.path) {
+            _ = try fileManager.replaceItemAt(logURL, withItemAt: temporary)
         } else {
-            try FileManager.default.moveItem(at: temporary, to: logURL)
+            try fileManager.moveItem(at: temporary, to: logURL)
         }
     }
 
@@ -115,16 +117,16 @@ struct AuditLogStore {
     }
 
     func erase() throws {
-        if FileManager.default.fileExists(atPath: logURL.path) {
-            try FileManager.default.removeItem(at: logURL)
+        if fileManager.fileExists(atPath: logURL.path) {
+            try fileManager.removeItem(at: logURL)
         }
-        guard !FileManager.default.fileExists(atPath: logURL.path) else {
+        guard !fileManager.fileExists(atPath: logURL.path) else {
             throw VaultError.storageFailure
         }
     }
 
     private func loadEntries() throws -> [LockedAuditEntry] {
-        guard let data = FileManager.default.contents(atPath: logURL.path) else { return [] }
+        guard let data = fileManager.contents(atPath: logURL.path) else { return [] }
         return try JSONDecoder().decode([LockedAuditEntry].self, from: data)
     }
 }
