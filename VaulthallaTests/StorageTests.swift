@@ -6,6 +6,8 @@ import CryptoKit
 import Security
 @testable import Vaulthalla
 
+private struct CreationCut: Error {}
+
 struct StorageTests {
     #if targetEnvironment(simulator)
     // Writes the global Keychain device secret, so it must run in the serial
@@ -343,4 +345,190 @@ private static let videoFixtureBase64 =
         #expect(empty.isEmpty)
     }
 
+
+    // MARK: - AUDIT #8 — interrupted pre-header creation
+
+    private struct IsolatedCreationScope {
+        let directory: URL
+        let account: String
+        /// Unique per scope: a model-level destruction wipes its whole
+        /// service, so scopes must never share one.
+        let service: String
+        func makeStore() -> VaultStore {
+            VaultStore(
+                fileManager: RedirectedFileManager(replacement: directory),
+                deviceSecretAccount: account,
+                deviceSecretService: service)
+        }
+        static func make() throws -> IsolatedCreationScope {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vaulthalla-creation-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return IsolatedCreationScope(
+                directory: directory,
+                account: "creation-test-\(UUID().uuidString)",
+                service: "io.sobaka.vaulthalla-tests-\(UUID().uuidString)")
+        }
+        func vaultDirectory() -> URL { directory.appendingPathComponent("Vaulthalla", isDirectory: true) }
+        func cleanup() {
+            try? KeychainStore.deleteDeviceSecret(account: account, service: service)
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    private func makeIsolatedAttemptStore() throws -> (store: AttemptStateStore, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("attempt-state-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var secret = Data(count: 32)
+        _ = secret.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let store = AttemptStateStore(
+            account: "attempt-test-\(UUID().uuidString)",
+            rootDirectory: directory,
+            deviceSecret: { secret },
+            service: VaulthallaTestKeychain.testService)
+        return (store, directory)
+    }
+
+    /// A power cut inside `resumeCreation` (index committed, header not yet
+    /// published) must leave a resumable state: no header, journal and index
+    /// intact, and a plain retry with the same password completes creation.
+    @Test func interruptedPreHeaderCreationRecoversOnRestart() async throws {
+        let password = "long-creation-test-password"
+
+        // Window A: crash after the index commit, before the header is staged.
+        let scopeA = try IsolatedCreationScope.make()
+        defer { scopeA.cleanup() }
+        let stagedA = scopeA.makeStore()
+        try await stagedA.createVault(password: password, segmentCapacity: .megabytes50, stopAfterStaging: true)
+        await stagedA.injectCreationFault { stage in
+            if stage == .afterIndexCommit { throw CreationCut() }
+        }
+        await #expect(throws: CreationCut.self) {
+            try await stagedA.resumeCreation(password: password)
+        }
+        let vaultA = scopeA.vaultDirectory()
+        #expect(!FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("vault.header").path))
+        #expect(!FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("vault.header.creation").path))
+        #expect(FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("index.v1").path))
+        #expect(FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("vault.creation").path))
+        let resumedA = scopeA.makeStore()
+        try await resumedA.resumeCreation(password: password)
+        #expect(FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("vault.header").path))
+        #expect(!FileManager.default.fileExists(atPath: vaultA.appendingPathComponent("vault.creation").path))
+        _ = try await resumedA.unlock(password: password)
+
+        // Window B: crash after the header is staged, before it is moved
+        // into place. The staged header must be verified and committed on
+        // retry.
+        let scopeB = try IsolatedCreationScope.make()
+        defer { scopeB.cleanup() }
+        let stagedB = scopeB.makeStore()
+        try await stagedB.createVault(password: password, segmentCapacity: .megabytes50, stopAfterStaging: true)
+        await stagedB.injectCreationFault { stage in
+            if stage == .afterHeaderStaged { throw CreationCut() }
+        }
+        await #expect(throws: CreationCut.self) {
+            try await stagedB.resumeCreation(password: password)
+        }
+        let vaultB = scopeB.vaultDirectory()
+        #expect(!FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.header").path))
+        #expect(FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.header.creation").path))
+        #expect(FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("index.v1").path))
+        #expect(FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.creation").path))
+        let resumedB = scopeB.makeStore()
+        try await resumedB.resumeCreation(password: password)
+        #expect(FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.header").path))
+        #expect(!FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.header.creation").path))
+        #expect(!FileManager.default.fileExists(atPath: vaultB.appendingPathComponent("vault.creation").path))
+        _ = try await resumedB.unlock(password: password)
+    }
+
+    /// A crash between the device-binding write and the journal write leaves
+    /// a device secret with no vault at all. Load must fail closed (destroy
+    /// the orphan binding) and a fresh vault must then be creatable.
+    @Test @MainActor func orphanDeviceBindingWithoutJournalDestroysAndAllowsNewVault() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        var orphan = Data(count: 32)
+        _ = orphan.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        try KeychainStore.saveDeviceSecret(orphan, account: scope.account, service: scope.service)
+
+        let store = scope.makeStore()
+        let model = VaultAppModel()
+        model.store = store
+        model.deviceSecretAccount = scope.account
+        model.deviceSecretService = scope.service
+        await model.load()
+        #expect(model.destructionMessage == "Vault destroyed because its header was lost.")
+        #expect(model.phase == .onboarding)
+        await #expect(throws: VaultError.keychainFailure(errSecItemNotFound)) {
+            _ = try KeychainStore.loadDeviceSecret(account: scope.account, service: scope.service)
+        }
+        // Cleanup cleared the orphan binding: creation works again.
+        try await store.createVault(password: "long-creation-test-password", segmentCapacity: .megabytes50)
+        #expect(await store.hasVault())
+    }
+
+    /// A crash after the header commit but before the journal cleanup leaves
+    /// a matching journal next to the committed vault: load cleans it up and
+    /// the vault stays fully usable.
+    @Test @MainActor func committedVaultCleansUpMatchingOrphanJournal() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        let store = scope.makeStore()
+        let password = "long-creation-test-password"
+        try await store.createVault(password: password, segmentCapacity: .megabytes50)
+        let vault = scope.vaultDirectory()
+        let header = try JSONDecoder().decode(VaultHeader.self, from: try Data(contentsOf: vault.appendingPathComponent("vault.header")))
+        let journal = VaultStore.CreationJournal(header: header, sealedSecrets: Data(repeating: 0, count: 28))
+        try JSONEncoder().encode(journal).write(to: vault.appendingPathComponent("vault.creation"))
+
+        let (attempts, attemptDir) = try makeIsolatedAttemptStore()
+        defer { try? FileManager.default.removeItem(at: attemptDir) }
+        let model = VaultAppModel()
+        model.store = store
+        model.attemptStore = attempts
+        model.deviceSecretAccount = scope.account
+        model.deviceSecretService = scope.service
+        await model.load()
+        #expect(model.destructionMessage.isEmpty)
+        #expect(model.phase == .locked)
+        #expect(!FileManager.default.fileExists(atPath: vault.appendingPathComponent("vault.creation").path))
+        _ = try await store.unlock(password: password)
+    }
+
+    /// A journal next to a committed vault whose header does NOT match is a
+    /// tamper signal: destroy, never ignore.
+    @Test @MainActor func committedVaultDestroysOnMismatchedOrphanJournal() async throws {
+        let scope = try IsolatedCreationScope.make()
+        defer { scope.cleanup() }
+        let store = scope.makeStore()
+        let vault = scope.vaultDirectory()
+        try await store.createVault(password: "long-creation-test-password", segmentCapacity: .megabytes50)
+        let header = try JSONDecoder().decode(VaultHeader.self, from: try Data(contentsOf: vault.appendingPathComponent("vault.header")))
+        let mismatched = VaultHeader(
+            segmentCapacity: header.segmentCapacity,
+            salt: Data(repeating: 0xEE, count: 32),
+            iterations: header.iterations,
+            wrappedRootKey: header.wrappedRootKey,
+            auditPublicKey: header.auditPublicKey)
+        let journal = VaultStore.CreationJournal(header: mismatched, sealedSecrets: Data(repeating: 0, count: 28))
+        try JSONEncoder().encode(journal).write(to: vault.appendingPathComponent("vault.creation"))
+
+        let (attempts, attemptDir) = try makeIsolatedAttemptStore()
+        defer { try? FileManager.default.removeItem(at: attemptDir) }
+        let model = VaultAppModel()
+        model.store = store
+        model.attemptStore = attempts
+        model.deviceSecretAccount = scope.account
+        model.deviceSecretService = scope.service
+        await model.load()
+        #expect(model.destructionMessage == "Vault destroyed because its creation state was confirmed tampered.")
+        #expect(model.phase == .onboarding)
+        #expect(!FileManager.default.fileExists(atPath: vault.path))
+        await #expect(throws: VaultError.keychainFailure(errSecItemNotFound)) {
+            _ = try KeychainStore.loadDeviceSecret(account: scope.account, service: scope.service)
+        }
+    }
 }

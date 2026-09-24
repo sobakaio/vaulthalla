@@ -142,6 +142,11 @@ final class VaultAppModel {
     private static let logger = Logger(subsystem: "io.sobaka.vaulthalla", category: "vault-lifecycle")
     /// Injectable for tests (§42); production always uses the shared stores.
     var store: VaultStore = .shared
+    /// Keychain scope of this model's vault. Tests inject an isolated
+    /// service/account so model-level destruction can never wipe the
+    /// production binding or another test's isolated state.
+    var deviceSecretAccount = KeychainStore.defaultDeviceSecretAccount
+    var deviceSecretService = KeychainStore.defaultService
     var attemptStore: AttemptStateStore = .shared
     var faceIDUnlocker: any FaceIDUnlocking = LiveFaceIDUnlocker()
     let webImportServer = LocalWebImportServer()
@@ -164,13 +169,13 @@ final class VaultAppModel {
         let hasJournal = await store.hasPendingCreation()
         if !hasHeader && !hasJournal { return true }
         do {
-            _ = try KeychainStore.loadDeviceSecret()
+            _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
             return true
         } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
             // Recheck before irreversible cleanup in case a transient Keychain
             // visibility change produced an apparent missing item.
             do {
-                _ = try KeychainStore.loadDeviceSecret()
+                _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
                 return true
             } catch VaultError.keychainFailure(let retry) where retry == errSecItemNotFound {
                 await completeAutoDestroy()
@@ -360,6 +365,14 @@ final class VaultAppModel {
         phase = hasVault ? .locked : .onboarding
         if hasVault {
             guard await requireDeviceBinding() else { return }
+            // AUDIT #8: a journal next to a committed vault is crash residue
+            // (clean it up) or a tamper signal (destroy, never ignore).
+            if await store.reconcileOrphanedCreationJournal() == .tampered {
+                phase = .locked
+                await completeAutoDestroy()
+                destructionMessage = "Vault destroyed because its creation state was confirmed tampered."
+                return
+            }
         } else {
             let pendingCreation = await store.hasPendingCreation()
             if await store.hasCommittedIndex() {
@@ -373,7 +386,7 @@ final class VaultAppModel {
                 guard await requireDeviceBinding() else { return }
             } else {
                 do {
-                    _ = try KeychainStore.loadDeviceSecret()
+                    _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
                     phase = .locked
                     await completeAutoDestroy()
                     destructionMessage = "Vault destroyed because its header was lost."
@@ -1546,7 +1559,7 @@ final class VaultAppModel {
             try await store.destroyVault()
             // Verify removal of all remaining wrappers and attempt state before
             // clearing the resumable destruction marker.
-            try KeychainStore.deleteAllVaulthallaItems()
+            try KeychainStore.deleteAllVaulthallaItems(inService: deviceSecretService)
         } catch {
             errorMessage = "Vault destruction failed. Cleanup must be retried."
             destructionInProgress = false

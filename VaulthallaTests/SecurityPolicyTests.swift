@@ -4,6 +4,13 @@ import CryptoKit
 import Security
 @testable import Vaulthalla
 
+/// Dedicated Keychain service for isolated tests. Production code and the
+/// fresh-install wipe (`deleteAllVaulthallaItems`) never touch it, so a
+/// model-level destruction in one test cannot race another test's items.
+enum VaulthallaTestKeychain {
+    static let testService = "io.sobaka.vaulthalla-tests"
+}
+
 struct SecurityPolicyTests {
     /// AUDIT #6 test isolation: unique Keychain account, temp shadow
     /// directory, and an injected device secret so a test can never touch the
@@ -18,7 +25,8 @@ struct SecurityPolicyTests {
         let store = AttemptStateStore(
             account: account,
             rootDirectory: directory,
-            deviceSecret: { secret })
+            deviceSecret: { secret },
+            service: VaulthallaTestKeychain.testService)
         return (store, directory, secret, account)
     }
 
@@ -27,7 +35,7 @@ struct SecurityPolicyTests {
     private func rawKeychainWrite(account: String, data: Data) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrService as String: VaulthallaTestKeychain.testService,
             kSecAttrAccount as String: account
         ]
         let updateAttrs: [String: Any] = [kSecValueData as String: data]
@@ -48,7 +56,7 @@ struct SecurityPolicyTests {
     private func rawKeychainDelete(account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrService as String: VaulthallaTestKeychain.testService,
             kSecAttrAccount as String: account
         ]
         let status = SecItemDelete(query as CFDictionary)
@@ -166,10 +174,13 @@ struct SecurityPolicyTests {
     #endif
 
     @Test(.serialized) func checkedConvenienceRemovalUsesIsolatedKeychainAccount() throws {
+        // ConvenienceUnlockStore lives in the production service, so the
+        // fixture must too (unique account keeps it isolated from the real
+        // PIN/Face ID wrappers).
         let account = "convenience-removal-test-\(UUID().uuidString)"
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrService as String: KeychainStore.defaultService,
             kSecAttrAccount as String: account
         ]
         defer { SecItemDelete(query as CFDictionary) }

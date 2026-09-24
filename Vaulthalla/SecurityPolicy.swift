@@ -64,7 +64,8 @@ enum AttemptPolicy {
 
 actor AttemptStateStore {
     static let shared = AttemptStateStore()
-    private let service = "io.sobaka.vaulthalla"
+    static let defaultService = "io.sobaka.vaulthalla"
+    private let service: String
     private let account: String
     private let fileManager: FileManager
     private let rootDirectory: URL
@@ -73,7 +74,9 @@ actor AttemptStateStore {
     init(account: String = "attempt-state-v1",
          fileManager: FileManager = .default,
          rootDirectory: URL? = nil,
-         deviceSecret: (@Sendable () throws -> Data)? = nil) {
+         deviceSecret: (@Sendable () throws -> Data)? = nil,
+         service: String = defaultService) {
+        self.service = service
         self.account = account
         self.fileManager = fileManager
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fileManager.temporaryDirectory

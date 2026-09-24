@@ -10,6 +10,7 @@ actor VaultStore {
     private let blockStore: EncryptedBlockStore
     private let auditRotationURL: URL
     private let deviceSecretAccount: String
+    private let deviceSecretService: String
 
     private struct AuditRotation: Codable {
         let privateKey: Data
@@ -24,14 +25,27 @@ actor VaultStore {
     func injectAuditRotationFault(_ fault: (@Sendable (AuditRotationBoundary) throws -> Void)?) {
         auditRotationFault = fault
     }
+
+    /// Power-cut simulation points inside `resumeCreation` (AUDIT #8):
+    /// after the index is committed but before the header is published.
+    enum CreationBoundary: CaseIterable, Sendable {
+        case afterIndexCommit
+        case afterHeaderStaged
+    }
+    private var creationFault: (@Sendable (CreationBoundary) throws -> Void)?
+    func injectCreationFault(_ fault: (@Sendable (CreationBoundary) throws -> Void)?) {
+        creationFault = fault
+    }
     #endif
 
     init(
         fileManager: FileManager = .default,
-        deviceSecretAccount: String = KeychainStore.defaultDeviceSecretAccount
+        deviceSecretAccount: String = KeychainStore.defaultDeviceSecretAccount,
+        deviceSecretService: String = KeychainStore.defaultService
     ) {
         self.fileManager = fileManager
         self.deviceSecretAccount = deviceSecretAccount
+        self.deviceSecretService = deviceSecretService
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fileManager.temporaryDirectory
         self.rootDirectory = appSupport.appendingPathComponent("Vaulthalla", isDirectory: true)
         self.headerURL = rootDirectory.appendingPathComponent("vault.header")
@@ -60,7 +74,7 @@ actor VaultStore {
         fileManager.fileExists(atPath: rootDirectory.appendingPathComponent("index.v1").path)
     }
 
-    private struct CreationJournal: Codable {
+    struct CreationJournal: Codable {
         let header: VaultHeader
         let sealedSecrets: Data
     }
@@ -85,7 +99,7 @@ actor VaultStore {
         }
         // Never replace a pre-existing device binding, even if the header was lost.
         do {
-            _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
+            _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
             throw VaultError.vaultAlreadyExists
         } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
             // Fresh installation.
@@ -109,7 +123,7 @@ actor VaultStore {
         // The device secret never appears in a file, even encrypted under the password.
         // If power fails before the journal is durable, creation fails closed with an
         // orphan Keychain binding rather than replacing it on the next attempt.
-        try KeychainStore.saveDeviceSecret(deviceSecret, account: deviceSecretAccount)
+        try KeychainStore.saveDeviceSecret(deviceSecret, account: deviceSecretAccount, service: deviceSecretService)
         let sealed = try AES.GCM.seal(auditPrivate.rawRepresentation, using: rootKey, authenticating: Data("Vaulthalla-creation-v1".utf8))
         let journal = CreationJournal(header: header, sealedSecrets: sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag)
         try writeProtectedNewFile(try JSONEncoder().encode(journal), at: creationURL)
@@ -132,7 +146,7 @@ actor VaultStore {
             ciphertext: journal.sealedSecrets.dropFirst(12).dropLast(16),
             tag: journal.sealedSecrets.suffix(16)
         )
-        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
         let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
         let rootKey: SymmetricKey
         do {
@@ -158,17 +172,49 @@ actor VaultStore {
             }
             try await blockStore.initialize(using: rootKey, auditPrivateKey: auditPrivateKey)
         }
+        #if DEBUG
+        if let creationFault { try creationFault(.afterIndexCommit) }
+        #endif
         // Move the authenticated, protected header into place last.
         let headerStage = rootDirectory.appendingPathComponent("vault.header.creation")
         if !fileManager.fileExists(atPath: headerStage.path) {
             try writeProtectedNewFile(try JSONEncoder().encode(journal.header), at: headerStage)
         } else {
-            guard (try? Data(contentsOf: headerStage)) == (try JSONEncoder().encode(journal.header)) else {
+            // Compare the decoded headers, not the raw bytes: JSON object
+            // key order is not guaranteed stable across encodes, so a byte
+            // comparison would randomly reject a legitimate staged header.
+            guard let stageData = try? Data(contentsOf: headerStage),
+                  let stagedHeader = try? JSONDecoder().decode(VaultHeader.self, from: stageData),
+                  stagedHeader == journal.header else {
                 throw VaultError.integrityFailure
             }
         }
+        #if DEBUG
+        if let creationFault { try creationFault(.afterHeaderStaged) }
+        #endif
         try fileManager.moveItem(at: headerStage, to: headerURL)
         try? fileManager.removeItem(at: creationURL)
+    }
+
+    /// A committed vault is authoritative. A creation journal surviving next
+    /// to it is crash residue from the window between the header commit and
+    /// the journal cleanup: a matching header is deleted, anything else is a
+    /// tamper signal the caller must resolve by destruction.
+    enum OrphanJournalState { case none, residue, tampered }
+
+    func reconcileOrphanedCreationJournal() -> OrphanJournalState {
+        guard hasVault(), fileManager.fileExists(atPath: creationURL.path) else { return .none }
+        do {
+            guard let data = try fileManager.contents(atPath: creationURL.path) else { return .tampered }
+            let journal = try JSONDecoder().decode(CreationJournal.self, from: data)
+            try journal.header.validate()
+            let committed = try loadHeader()
+            guard journal.header == committed else { return .tampered }
+        } catch {
+            return .tampered
+        }
+        try? fileManager.removeItem(at: creationURL)
+        return .residue
     }
 
     private func writeProtectedNewFile(_ data: Data, at url: URL) throws {
@@ -215,7 +261,7 @@ actor VaultStore {
     func unlock(password: String) async throws -> SymmetricKey {
         guard hasVault() else { throw VaultError.noVault }
         let header = try loadHeader()
-        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
         let passwordKey = try PasswordKDF.deriveKey(password: password, salt: header.salt, iterations: header.iterations)
         let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
         do {
@@ -233,7 +279,7 @@ actor VaultStore {
             throw VaultError.invalidPassword
         }
         let header = try loadHeader()
-        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
         let salt = VaultCrypto.randomData(count: 32)
         let iterations = try PasswordKDF.calibratedIterations()
         let passwordKey = try PasswordKDF.deriveKey(password: password, salt: salt, iterations: iterations)
@@ -275,7 +321,7 @@ actor VaultStore {
     func destroyVault() async throws {
         await blockStore.revokeAccess()
         // Key destruction is deliberately first; filesystem cleanup cannot restore access.
-        try KeychainStore.deleteDeviceSecret(account: deviceSecretAccount)
+        try KeychainStore.deleteDeviceSecret(account: deviceSecretAccount, service: deviceSecretService)
         if fileManager.fileExists(atPath: rootDirectory.path) {
             try fileManager.removeItem(at: rootDirectory)
         }

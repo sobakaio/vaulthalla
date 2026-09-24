@@ -275,12 +275,15 @@ struct WebImportEndToEndTests {
             .appendingPathComponent("vaulthalla-webimport-e2e-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let account = "e2e-web-import-\(UUID().uuidString)"
-        let store = VaultStore(fileManager: RedirectedFileManager(replacement: directory), deviceSecretAccount: account)
+        let store = VaultStore(
+            fileManager: RedirectedFileManager(replacement: directory),
+            deviceSecretAccount: account,
+            deviceSecretService: VaulthallaTestKeychain.testService)
         return (store, directory, account)
     }
 
     private func cleanupIsolatedVault(directory: URL, account: String) {
-        try? KeychainStore.deleteDeviceSecret(account: account)
+        try? KeychainStore.deleteDeviceSecret(account: account, service: VaulthallaTestKeychain.testService)
         try? FileManager.default.removeItem(at: directory)
     }
 
