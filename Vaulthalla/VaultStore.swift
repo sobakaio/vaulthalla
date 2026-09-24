@@ -9,6 +9,7 @@ actor VaultStore {
     private let headerURL: URL
     private let blockStore: EncryptedBlockStore
     private let auditRotationURL: URL
+    private let deviceSecretAccount: String
 
     private struct AuditRotation: Codable {
         let privateKey: Data
@@ -25,8 +26,12 @@ actor VaultStore {
     }
     #endif
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        deviceSecretAccount: String = KeychainStore.defaultDeviceSecretAccount
+    ) {
         self.fileManager = fileManager
+        self.deviceSecretAccount = deviceSecretAccount
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fileManager.temporaryDirectory
         self.rootDirectory = appSupport.appendingPathComponent("Vaulthalla", isDirectory: true)
         self.headerURL = rootDirectory.appendingPathComponent("vault.header")
@@ -80,7 +85,7 @@ actor VaultStore {
         }
         // Never replace a pre-existing device binding, even if the header was lost.
         do {
-            _ = try KeychainStore.loadDeviceSecret()
+            _ = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
             throw VaultError.vaultAlreadyExists
         } catch VaultError.keychainFailure(let status) where status == errSecItemNotFound {
             // Fresh installation.
@@ -104,7 +109,7 @@ actor VaultStore {
         // The device secret never appears in a file, even encrypted under the password.
         // If power fails before the journal is durable, creation fails closed with an
         // orphan Keychain binding rather than replacing it on the next attempt.
-        try KeychainStore.saveDeviceSecret(deviceSecret)
+        try KeychainStore.saveDeviceSecret(deviceSecret, account: deviceSecretAccount)
         let sealed = try AES.GCM.seal(auditPrivate.rawRepresentation, using: rootKey, authenticating: Data("Vaulthalla-creation-v1".utf8))
         let journal = CreationJournal(header: header, sealedSecrets: sealed.nonce.withUnsafeBytes { Data($0) } + sealed.ciphertext + sealed.tag)
         try writeProtectedNewFile(try JSONEncoder().encode(journal), at: creationURL)
@@ -127,7 +132,7 @@ actor VaultStore {
             ciphertext: journal.sealedSecrets.dropFirst(12).dropLast(16),
             tag: journal.sealedSecrets.suffix(16)
         )
-        let deviceSecret = try KeychainStore.loadDeviceSecret()
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
         let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
         let rootKey: SymmetricKey
         do {
@@ -210,7 +215,7 @@ actor VaultStore {
     func unlock(password: String) async throws -> SymmetricKey {
         guard hasVault() else { throw VaultError.noVault }
         let header = try loadHeader()
-        let deviceSecret = try KeychainStore.loadDeviceSecret()
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
         let passwordKey = try PasswordKDF.deriveKey(password: password, salt: header.salt, iterations: header.iterations)
         let kek = VaultCrypto.makeKEK(passwordKey: passwordKey, deviceSecret: deviceSecret)
         do {
@@ -228,7 +233,7 @@ actor VaultStore {
             throw VaultError.invalidPassword
         }
         let header = try loadHeader()
-        let deviceSecret = try KeychainStore.loadDeviceSecret()
+        let deviceSecret = try KeychainStore.loadDeviceSecret(account: deviceSecretAccount)
         let salt = VaultCrypto.randomData(count: 32)
         let iterations = try PasswordKDF.calibratedIterations()
         let passwordKey = try PasswordKDF.deriveKey(password: password, salt: salt, iterations: iterations)
@@ -270,7 +275,7 @@ actor VaultStore {
     func destroyVault() async throws {
         await blockStore.revokeAccess()
         // Key destruction is deliberately first; filesystem cleanup cannot restore access.
-        try KeychainStore.deleteDeviceSecret()
+        try KeychainStore.deleteDeviceSecret(account: deviceSecretAccount)
         if fileManager.fileExists(atPath: rootDirectory.path) {
             try fileManager.removeItem(at: rootDirectory)
         }

@@ -32,6 +32,13 @@ final class LocalWebImportServer {
     var state: State = .stopped
     var pairingPIN = ""
     var importURL: URL?
+    /// Loopback endpoint for same-host clients (tests). `importURL` is the
+    /// LAN address advertised to phones and is not always reachable from the
+    /// host itself.
+    var loopbackURL: URL? {
+        guard case .running = state, let port = listener?.port?.rawValue else { return nil }
+        return URL(string: "http://127.0.0.1:\(port)")
+    }
     var activeFilename = ""
     var uploadedCount = 0
     /// Called (on the main actor) after each successfully imported file so the
@@ -40,7 +47,14 @@ final class LocalWebImportServer {
     var lastMessage = ""
     var expiresAt: Date?
 
-    private let store = VaultStore.shared
+    private let store: VaultStore
+
+    /// The shared store keeps production behavior; tests inject an isolated
+    /// vault so end-to-end import tests never touch the user's vault.
+    init(store: VaultStore = .shared) {
+        self.store = store
+    }
+
     private var listener: NWListener?
     /// Monotonic token so state/connection callbacks from a cancelled or
     /// replaced listener are ignored instead of corrupting the current

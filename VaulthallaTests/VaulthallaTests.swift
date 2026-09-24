@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import CryptoKit
 @testable import Vaulthalla
+import Network
 
 struct VaulthallaTests {
     @Test @MainActor func webImportServerStartsInDefaultBuild() async {
@@ -257,3 +258,172 @@ struct VaulthallaTests {
         #expect(try await store.plaintext(for: secondRecord!) == sharedPrefix + Data(repeating: 2, count: 100))
     }
 }
+
+
+/// AUDIT #4 — end-to-end Web Import: real pairing over TCP, real uploads,
+/// stop/drain, restart, and an in-flight upload torn down by stop/drain.
+///
+/// Isolation: the test uses its own redirected file system (a temp
+/// directory) and its own Keychain account, so it can run in parallel with
+/// every other test — including the other device-secret test that uses the
+/// shared App Support directory and the default account.
+#if targetEnvironment(simulator)
+@MainActor
+struct WebImportEndToEndTests {
+    private func prepareIsolatedVault() throws -> (store: VaultStore, directory: URL, account: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vaulthalla-webimport-e2e-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let account = "e2e-web-import-\(UUID().uuidString)"
+        let store = VaultStore(fileManager: RedirectedFileManager(replacement: directory), deviceSecretAccount: account)
+        return (store, directory, account)
+    }
+
+    private func cleanupIsolatedVault(directory: URL, account: String) {
+        try? KeychainStore.deleteDeviceSecret(account: account)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func waitForServerState(_ server: LocalWebImportServer, _ state: LocalWebImportServer.State) async -> Bool {
+        for _ in 0..<200 {
+            if server.state == state { return true }
+            if case .failed = server.state { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return server.state == state
+    }
+
+    private func pairWithServer(_ server: LocalWebImportServer) async throws -> (base: URL, token: String)? {
+        guard let base = server.loopbackURL, !server.pairingPIN.isEmpty else { return nil }
+        var request = URLRequest(url: base.appendingPathComponent("pair"))
+        request.httpMethod = "POST"
+        request.httpBody = server.pairingPIN.data(using: .ascii)
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            Issue.record("Pairing failed with status \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+            return nil
+        }
+        guard let html = String(data: data, encoding: .utf8),
+              let start = html.range(of: "/import/"),
+              let end = html.range(of: "/upload", range: start.upperBound..<html.endIndex) else {
+            Issue.record("Pairing response is missing the import endpoint")
+            return nil
+        }
+        let token = String(html[start.upperBound..<end.lowerBound])
+        guard !token.isEmpty else { return nil }
+        return (base, token)
+    }
+
+    private func uploadToServer(_ payload: Data, filename: String, base: URL, token: String) async -> Int? {
+        var request = URLRequest(
+            url: base.appendingPathComponent("import")
+                .appendingPathComponent(token)
+                .appendingPathComponent("upload"))
+        request.httpMethod = "POST"
+        request.setValue(filename, forHTTPHeaderField: "x-filename")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "x-mime-type")
+        request.httpBody = payload
+        request.timeoutInterval = 30
+        guard let (_, response) = try? await URLSession.shared.data(for: request) else { return nil }
+        return (response as? HTTPURLResponse)?.statusCode
+    }
+
+    private func sendAll(_ client: NWConnection, _ data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            var resumed = false
+            client.send(content: data, completion: .contentProcessed { error in
+                guard !resumed else { return }
+                resumed = true
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            })
+        }
+    }
+
+    @Test(.serialized)
+    func webImportEndToEndPairUploadDrainRestart() async throws {
+        let (store, directory, account) = try prepareIsolatedVault()
+        defer { cleanupIsolatedVault(directory: directory, account: account) }
+        try await store.createVault(password: "e2e-web-import-password", segmentCapacity: .megabytes50)
+        let rootKey = try await store.unlock(password: "e2e-web-import-password")
+
+        let server = LocalWebImportServer(store: store)
+        server.start(rootKey: rootKey)
+        defer { server.stop() }
+        guard await waitForServerState(server, .running) else {
+            Issue.record("Web Import server did not reach .running")
+            return
+        }
+        guard let (base, token) = try await pairWithServer(server) else { return }
+
+        // Session 1: pair, upload, verify plaintext round-trip.
+        let payload1 = Data((0..<8192).map { _ in UInt8.random(in: 0...255) })
+        #expect(await uploadToServer(payload1, filename: "alpha.bin", base: base, token: token) == 201)
+        var snapshot = await store.indexSnapshot()
+        let record1 = try #require(snapshot.records.values.first { $0.filename == "alpha.bin" })
+        #expect(try await store.readMedia(record1, using: rootKey) == payload1)
+
+        // Stop + drain, restart, pair again: new token, uploads keep working.
+        await server.stopAndDrain()
+        #expect(server.state == .stopped)
+        server.start(rootKey: rootKey)
+        guard await waitForServerState(server, .running),
+              let (base2, token2) = try await pairWithServer(server) else {
+            Issue.record("Web Import server did not restart after drain")
+            return
+        }
+        #expect(token2 != token)
+        let payload2 = Data(repeating: 0xA5, count: 7777)
+        #expect(await uploadToServer(payload2, filename: "beta.bin", base: base2, token: token2) == 201)
+        snapshot = await store.indexSnapshot()
+        let record2 = try #require(snapshot.records.values.first { $0.filename == "beta.bin" })
+        #expect(try await store.readMedia(record2, using: rootKey) == payload2)
+        #expect(snapshot.records.values.first { $0.filename == "alpha.bin" } != nil)
+
+        // A token from the previous session must be rejected after restart.
+        #expect(await uploadToServer(payload2, filename: "stale.bin", base: base2, token: token) == 400)
+        #expect(await store.indexSnapshot().records.values.first { $0.filename == "stale.bin" } == nil)
+
+        // Same server, restarted: an upload in flight when stop/drain runs
+        // must be discarded — no partial record, and the vault must stay
+        // readable with its earlier contents.
+        server.stop()
+        server.start(rootKey: rootKey)
+        guard await waitForServerState(server, .running),
+              let (base3, token3) = try await pairWithServer(server) else {
+            Issue.record("Web Import server did not restart for the drain scenario")
+            return
+        }
+        let clientPort = base3.port ?? 80
+        let client = NWConnection(
+            host: NWEndpoint.Host(base3.host!),
+            port: NWEndpoint.Port(rawValue: UInt16(clientPort))!,
+            using: .tcp)
+        client.start(queue: DispatchQueue(label: "vaulthalla.web-import.e2e.client"))
+        let header = "POST /import/\(token3)/upload HTTP/1.1\r\nHost: \(base3.host!)\r\nx-filename: partial.bin\r\nx-mime-type: application/octet-stream\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n"
+        try await sendAll(client, Data(header.utf8))
+        try await sendAll(client, Data(repeating: 0x11, count: 32768))
+        var inFlight = false
+        for _ in 0..<200 {
+            if server.activeFilename == "partial.bin" { inFlight = true; break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard inFlight else {
+            Issue.record("Upload did not reach the in-flight state; drain assertion skipped")
+            client.cancel()
+            return
+        }
+        defer { client.cancel() }
+        await server.stopAndDrain()
+        #expect(server.state == .stopped)
+        _ = try? await sendAll(client, Data(repeating: 0x22, count: 32768))
+
+        // A partial upload must never be committed, and the vault must stay
+        // readable with its pre-upload contents.
+        let finalSnapshot = await store.indexSnapshot()
+        #expect(finalSnapshot.records.values.first { $0.filename == "partial.bin" } == nil)
+        #expect(try await store.readMedia(record2, using: rootKey) == payload2)
+    }
+}
+#endif

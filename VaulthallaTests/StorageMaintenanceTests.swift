@@ -265,7 +265,6 @@ private actor SuspendedImportSource {
     }
 }
 
-#if targetEnvironment(simulator)
 extension StorageMaintenanceTests {
     @Test(arguments: [false, true])
     func revokedSuspendedStreamCannotCommitAfterReactivation(resumeWithChunk: Bool) async throws {
@@ -316,5 +315,44 @@ extension StorageMaintenanceTests {
         #expect(persistedExisting.sha256 == originalDigest)
         #expect(try await reopened.plaintext(for: persistedExisting) == existingBytes)
     }
+
+    /// AUDIT #4: destruction runs while a stream import is suspended mid-flight.
+    /// Revocation stays in force through destruction, so the stale task must
+    /// abort — and it must not recreate vault storage after the directory is
+    /// gone (no header, no index, no segments).
+    @Test(arguments: [false, true])
+    func destroyedVaultIsNotRecreatedByStaleImport(resumeWithChunk: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let vault = directory.appendingPathComponent("vault", isDirectory: true)
+        let key = SymmetricKey(size: .bits256)
+        let store = EncryptedBlockStore(rootDirectory: vault)
+        let existingBytes = Data(repeating: 0x47, count: 4093)
+        let existingURL = directory.appendingPathComponent("existing.bin")
+        try existingBytes.write(to: existingURL)
+        _ = try await store.importFile(at: existingURL, filename: "existing.bin", mimeType: "application/octet-stream", rootKey: key, segmentCapacity: 3_000_000)
+
+        let source = SuspendedImportSource(resumeData: resumeWithChunk ? Data(repeating: 0xBC, count: 19) : nil)
+        let stream = AsyncThrowingStream<Data, Error>(unfolding: { await source.next() })
+        let importTask = Task {
+            try await store.importStream(stream, filename: "stale.bin", mimeType: "application/octet-stream", rootKey: key, segmentCapacity: 3_000_000)
+        }
+        // First full chunk is on disk; the import is suspended in the stream.
+        await source.waitUntilSuspended()
+        await store.revokeAccess()
+        // Destruction: VaultStore.destroyVault deletes the directory after key
+        // destruction; here the Keychain key is out of scope, so directory
+        // removal plus revocation is the equivalent final state.
+        try FileManager.default.removeItem(at: vault)
+        await source.release()
+        do {
+            _ = try await importTask.value
+            Issue.record("Stale import completed after destruction")
+        } catch {
+            // Expected: revocation aborts the import whatever it was holding.
+        }
+        #expect(!FileManager.default.fileExists(atPath: vault.path))
+    }
 }
-#endif
+

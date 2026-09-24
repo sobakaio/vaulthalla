@@ -156,9 +156,11 @@ struct PasswordKDF {
 
 enum KeychainStore {
     private static let service = "io.sobaka.vaulthalla"
-    private static let account = "device-secret-v1"
+    /// Default device-binding account. Tests inject a unique account so an
+    /// isolated test vault can never collide with the production binding.
+    static let defaultDeviceSecretAccount = "device-secret-v1"
 
-    static func saveDeviceSecret(_ data: Data) throws {
+    static func saveDeviceSecret(_ data: Data, account: String = defaultDeviceSecretAccount) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -170,10 +172,10 @@ enum KeychainStore {
         // Creation must never replace another vault's device binding.
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else { throw VaultError.keychainFailure(status) }
-        guard try loadDeviceSecret() == data else { throw VaultError.integrityFailure }
+        guard try loadDeviceSecret(account: account) == data else { throw VaultError.integrityFailure }
     }
 
-    static func loadDeviceSecret() throws -> Data {
+    static func loadDeviceSecret(account: String = defaultDeviceSecretAccount) throws -> Data {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -189,7 +191,7 @@ enum KeychainStore {
         return data
     }
 
-    static func deleteDeviceSecret() throws {
+    static func deleteDeviceSecret(account: String = defaultDeviceSecretAccount) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
