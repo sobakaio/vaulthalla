@@ -5,6 +5,58 @@ import Security
 @testable import Vaulthalla
 
 struct SecurityPolicyTests {
+    /// AUDIT #6 test isolation: unique Keychain account, temp shadow
+    /// directory, and an injected device secret so a test can never touch the
+    /// production attempt state or shadow file.
+    private func makeIsolatedStore() throws -> (store: AttemptStateStore, directory: URL, secret: Data, account: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("attempt-state-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var secret = Data(count: 32)
+        _ = secret.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let account = "attempt-test-\(UUID().uuidString)"
+        let store = AttemptStateStore(
+            account: account,
+            rootDirectory: directory,
+            deviceSecret: { secret })
+        return (store, directory, secret, account)
+    }
+
+    /// Writes arbitrary bytes to a Keychain item (simulates external
+    /// tampering of the counter item).
+    private func rawKeychainWrite(account: String, data: Data) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrAccount as String: account
+        ]
+        let updateAttrs: [String: Any] = [kSecValueData as String: data]
+        let updated = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
+        if updated == errSecSuccess { return }
+        guard updated == errSecItemNotFound else {
+            throw AttemptStateStore.PersistenceError.keychain(updated)
+        }
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        add[kSecAttrSynchronizable as String] = false
+        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else {
+            throw AttemptStateStore.PersistenceError.keychain(updated)
+        }
+    }
+
+    private func rawKeychainDelete(account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.sobaka.vaulthalla",
+            kSecAttrAccount as String: account
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw AttemptStateStore.PersistenceError.keychain(status)
+        }
+    }
+
     @Test func progressiveDelayIsBoundedAndIncreasing() {
         #expect(AttemptPolicy.delay(for: 0) == 0)
         #expect(AttemptPolicy.delay(for: 1) < AttemptPolicy.delay(for: 4))
@@ -30,8 +82,8 @@ struct SecurityPolicyTests {
     }
 
     @Test(.serialized) func checkedAttemptStatePersistsAndDoesNotDeleteBeforeUpdate() async throws {
-        let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
-        await store.erase()
+        let (store, directory, _, _) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
         var state = AttemptState()
         state.autoDestroyEnabled = true
         state.autoDestroyThreshold = 2
@@ -45,15 +97,15 @@ struct SecurityPolicyTests {
             try await store.recordSuccessChecked(method: .password)
         }
         #expect(try await store.loadChecked() == terminal)
-        await store.erase()
     }
 
     @Test(.serialized) @MainActor func persistedLockoutsRejectStaleConvenienceWrappers() async throws {
-        let attempts = AttemptStateStore(account: "lockout-test-\(UUID().uuidString)")
+        let (attempts, shadowDirectory, _, _) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: shadowDirectory) }
         var state = AttemptState()
         state.pinFailures = state.pinThreshold
         state.faceIDFailures = 0
-        try await attempts.saveChecked(state)
+        state = try await attempts.saveChecked(state)
         await #expect(throws: AttemptStateStore.PersistenceError.self) {
             try await attempts.recordSuccessChecked(method: .pin)
         }
@@ -83,14 +135,13 @@ struct SecurityPolicyTests {
         #expect(!model.pinEnabled && !model.faceIDEnabled)
         state.pinFailures = 0
         state.faceIDFailures = state.faceIDThreshold
-        try await attempts.saveChecked(state)
+        state = try await attempts.saveChecked(state)
         await #expect(throws: AttemptStateStore.PersistenceError.self) {
             try await attempts.recordSuccessChecked(method: .pin)
         }
         model.pinEnabled = true
         await model.unlockWithPIN()
         #expect(!model.pinEnabled && model.phase == .locked)
-        await attempts.erase()
     }
 
     #if !targetEnvironment(simulator)
@@ -142,24 +193,24 @@ struct SecurityPolicyTests {
     }
     #endif
 
-    @Test(.serialized) @MainActor func attemptStoreAndFaceIDStateMachine() async {
-        let store = AttemptStateStore(account: "attempt-test-\(UUID().uuidString)")
+    @Test(.serialized) @MainActor func attemptStoreAndFaceIDStateMachine() async throws {
+        let (store, shadowDirectory, _, _) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: shadowDirectory) }
 
         // Part 1 — counters persist across loads.
-        await store.erase()
-        let first = await store.recordFailure(method: .pin)
+        let first = try await store.recordFailureChecked(method: .pin)
         #expect(first.pinFailures == 1)
-        #expect((await store.load()).pinFailures == 1)
-        let success = await store.recordSuccess(method: .pin)
+        #expect((try await store.loadChecked()).pinFailures == 1)
+        let success = try await store.recordSuccessChecked(method: .pin)
         #expect(success.pinFailures == 0)
-        #expect((await store.load()).pinFailures == 0)
+        #expect((try await store.loadChecked()).pinFailures == 0)
 
         // Part 2 — Face ID failures lock out at the stored threshold (default 3).
+        try await store.saveChecked(AttemptState())
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        await store.erase()
         let model = VaultAppModel()
         model.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
         model.attemptStore = store
@@ -187,7 +238,7 @@ struct SecurityPolicyTests {
 
         // Part 3 — a valid biometric result clears its counter, but a missing
         // vault index must not expose the unlocked UI.
-        await store.erase()
+        try await store.saveChecked(AttemptState())
         let successModel = VaultAppModel()
         successModel.store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
         successModel.attemptStore = store
@@ -200,9 +251,87 @@ struct SecurityPolicyTests {
         await successModel.unlockWithFaceID()
         #expect(successModel.phase == .locked)
         #expect(successModel.rootKey == nil)
-        #expect((await store.load()).faceIDFailures == 0)
+        #expect((try await store.loadChecked()).faceIDFailures == 0)
+    }
 
-        await store.erase()
+    // MARK: - AUDIT #6 — authenticated shadow (rollback / deletion detection)
+
+    @Test(.serialized) func freshFirstUseHasNoTamperVerdict() async throws {
+        let (store, directory, _, _) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        #expect(try await store.loadChecked() == AttemptState())
+    }
+
+    @Test(.serialized) func shadowDetectsKeychainRollback() async throws {
+        let (store, directory, _, account) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var state = AttemptState()
+        state.pinFailures = 3
+        try await store.saveChecked(state)
+        // An external actor rewinds the counter item to a fresh install.
+        try rawKeychainWrite(account: account, data: JSONEncoder().encode(AttemptState()))
+        await #expect(throws: AttemptStateStore.PersistenceError.tampered) {
+            _ = try await store.loadChecked()
+        }
+    }
+
+    @Test(.serialized) func shadowDetectsKeychainDeletion() async throws {
+        let (store, directory, _, account) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await store.saveChecked(AttemptState())
+        try rawKeychainDelete(account: account)
+        await #expect(throws: AttemptStateStore.PersistenceError.tampered) {
+            _ = try await store.loadChecked()
+        }
+    }
+
+    @Test(.serialized) func corruptedShadowSealIsTampered() async throws {
+        let (store, directory, _, _) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await store.saveChecked(AttemptState())
+        let seal = directory.appendingPathComponent("attempt-state.seal")
+        var junk = try Data(contentsOf: seal)
+        junk[0] ^= 0xFF
+        try junk.write(to: seal)
+        await #expect(throws: AttemptStateStore.PersistenceError.tampered) {
+            _ = try await store.loadChecked()
+        }
+    }
+
+    @Test(.serialized) func shadowLagFromCrashWindowSelfHeals() async throws {
+        let (store, directory, _, account) = try makeIsolatedStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var state = AttemptState()
+        state.pinFailures = 1
+        state = try await store.saveChecked(state)
+        // Simulate a crash between the Keychain write and the shadow write:
+        // the Keychain item advances, the shadow stays behind.
+        var advanced = state
+        advanced.pinFailures = 2
+        advanced.version = state.version + 1
+        try rawKeychainWrite(account: account, data: JSONEncoder().encode(advanced))
+        // The lag is a crash window, not tampering: the state is accepted and
+        // the shadow is re-established.
+        #expect(try await store.loadChecked() == advanced)
+        let seal = directory.appendingPathComponent("attempt-state.seal")
+        #expect(FileManager.default.fileExists(atPath: seal.path))
+        #expect(try await store.loadChecked() == advanced)
+    }
+
+    @Test(.serialized) func shadowPersistsAcrossStoreInstances() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("attempt-state-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var secret = Data(count: 32)
+        _ = secret.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let account = "attempt-test-\(UUID().uuidString)"
+        let first = AttemptStateStore(account: account, rootDirectory: directory, deviceSecret: { secret })
+        var state = AttemptState()
+        state.passwordFailures = 2
+        state = try await first.saveChecked(state)
+        let second = AttemptStateStore(account: account, rootDirectory: directory, deviceSecret: { secret })
+        #expect(try await second.loadChecked() == state)
     }
 }
 

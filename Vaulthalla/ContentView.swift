@@ -387,12 +387,26 @@ final class VaultAppModel {
                 }
             }
         }
-        if hasVault, let state = try? await attemptStore.loadChecked(), AttemptPolicy.shouldDestroy(state: state) {
-            await completeAutoDestroy()
-            return
-        }
         if hasVault {
-            guard (try? await attemptStore.loadChecked()) != nil else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            do {
+                let state = try await attemptStore.loadChecked()
+                if AttemptPolicy.shouldDestroy(state: state) {
+                    await completeAutoDestroy()
+                    return
+                }
+            } catch AttemptStateStore.PersistenceError.tampered {
+                // AUDIT #6: the Keychain counter was rolled back or deleted
+                // behind its authenticated shadow. Confirmed tampered state ⇒
+                // resumable destruction, never "open as fresh".
+                phase = .locked
+                await completeAutoDestroy()
+                destructionMessage = "Vault destroyed because its security state was confirmed tampered."
+                return
+            } catch {
+                phase = .locked
+                errorMessage = "Security state unavailable. Unlock blocked."
+                return
+            }
         }
         pinEnabled = ConvenienceUnlockStore.hasPIN()
         faceIDEnabled = ConvenienceUnlockStore.hasFaceID()
@@ -443,7 +457,17 @@ final class VaultAppModel {
         defer { isBusy = false }
         let generation = sessionGeneration
         guard await requireDeviceBinding() else { return }
-        guard let currentState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        let currentState: AttemptState
+        do {
+            currentState = try await attemptStore.loadChecked()
+        } catch AttemptStateStore.PersistenceError.tampered {
+            await completeAutoDestroy()
+            destructionMessage = "Vault destroyed because its security state was confirmed tampered."
+            return
+        } catch {
+            errorMessage = "Security state unavailable. Unlock blocked."
+            return
+        }
         if AttemptPolicy.shouldDestroy(state: currentState) {
             await completeAutoDestroy()
             return
@@ -1192,7 +1216,17 @@ final class VaultAppModel {
         defer { isBusy = false }
         let generation = sessionGeneration
         guard await requireDeviceBinding() else { return }
-        guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        let state: AttemptState
+        do {
+            state = try await attemptStore.loadChecked()
+        } catch AttemptStateStore.PersistenceError.tampered {
+            await completeAutoDestroy()
+            destructionMessage = "Vault destroyed because its security state was confirmed tampered."
+            return
+        } catch {
+            errorMessage = "Security state unavailable. Unlock blocked."
+            return
+        }
         if AttemptPolicy.shouldDestroy(state: state) { await completeAutoDestroy(); return }
         guard !AttemptPolicy.convenienceLockedOut(state: state) else {
             pinEnabled = false
@@ -1241,7 +1275,17 @@ final class VaultAppModel {
         guard faceIDEnabled else { return }
         let generation = sessionGeneration
         guard await requireDeviceBinding() else { return }
-        guard let persistedState = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+        let persistedState: AttemptState
+        do {
+            persistedState = try await attemptStore.loadChecked()
+        } catch AttemptStateStore.PersistenceError.tampered {
+            await completeAutoDestroy()
+            destructionMessage = "Vault destroyed because its security state was confirmed tampered."
+            return
+        } catch {
+            errorMessage = "Security state unavailable. Unlock blocked."
+            return
+        }
         if AttemptPolicy.shouldDestroy(state: persistedState) { await completeAutoDestroy(); return }
         guard !AttemptPolicy.convenienceLockedOut(state: persistedState) else {
             faceIDEnabled = false
