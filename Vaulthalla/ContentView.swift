@@ -31,6 +31,10 @@ struct ContentView: View {
             }
         }
         .task { await model.load() }
+        #if DEBUG
+        .task { await model.autoFaceIDUnlockForDiagnostics() }
+        .task { await model.autoCreateVaultForDiagnostics() }
+        #endif
         .onChange(of: scenePhase) { _, phase in
             if phase == .inactive {
                 privacyCover = true
@@ -158,7 +162,15 @@ final class VaultAppModel {
     private var loaded = false
     private var sessionGeneration: UInt64 = 0
     private var destructionInProgress = false
-    var isApplicationActive: () -> Bool = { UIApplication.shared.applicationState == .active }
+    /// Whether the app is in the foreground: `.active` **or** the transient
+    /// `.inactive` state (biometric prompt, permission sheet, app switcher,
+    /// incoming call). Only `.background` (app not visible) counts as not
+    /// foreground. The old `== .active` check was too strict: during a Face ID
+    /// unlock the biometric overlay leaves the app `.inactive`, so the unlock
+    /// completion gate failed silently and the vault never opened (TODO #1).
+    /// Genuine background/screenshot locking is still enforced by the
+    /// session-generation bump in `lock()`, which `canFinishUnlock` also checks.
+    var isApplicationActive: () -> Bool = { UIApplication.shared.applicationState != .background }
 
     /// A missing device binding for an existing vault is not a bad password.
     /// Other Keychain errors may be temporary, so they block access without wiping.
@@ -194,6 +206,23 @@ final class VaultAppModel {
     private func canFinishUnlock(_ generation: UInt64) -> Bool {
         sessionGeneration == generation && phase == .locked &&
         isApplicationActive() && !Task.isCancelled && !destructionInProgress
+    }
+
+    /// Diagnostic (TODO #1): log to BOTH os_log and stdout (devicectl --console).
+    func fdTrace(_ message: String) {
+        print("FDTRACE " + message)
+        Self.logger.info("\(message, privacy: .public)")
+    }
+
+    /// Diagnostic (TODO #1): log exactly which gate condition blocks an unlock.
+    private func fdGate(_ tag: String, generation: UInt64) -> Bool {
+        let gen = sessionGeneration == generation
+        let ph = phase == .locked
+        let act = isApplicationActive()
+        let tc = !Task.isCancelled
+        let di = !destructionInProgress
+        fdTrace("FD-GATE \(tag) pass=\(gen && ph && act && tc && di) generationMatch=\(gen) [now=\(sessionGeneration) then=\(generation)] phaseLocked=\(ph) appActive=\(act) taskCancelled=\(!tc) destructionInProgress=\(di) appState=\(String(describing: UIApplication.shared.applicationState))")
+        return gen && ph && act && tc && di
     }
     private var generatedPreviewIDs = Set<UUID>()
 
@@ -684,10 +713,11 @@ final class VaultAppModel {
         // the first index load after a background lock fails and PIN/Face ID
         // look broken ("Vault Integrity Error" / endless Face ID loop).
         await store.activateAccess()
+        fdTrace("FD-2 finishUnlock: activateAccess done, appState=\(String(describing: UIApplication.shared.applicationState))")
         let generation = sessionGeneration
         let initialPhase = phase
         rootKey = key
-        guard await refreshIndex() else {
+        guard await refreshIndex() else { fdTrace("FD-3 refreshIndex FAILED errorMessage=\(errorMessage)"); 
             if phase != .onboarding {
                 rootKey = nil
                 records = []
@@ -715,12 +745,14 @@ final class VaultAppModel {
         }
         guard !destructionInProgress, rootKey != nil, sessionGeneration == generation,
               phase == initialPhase, isApplicationActive() else {
+            fdTrace("FD-4 finishUnlock FINAL GUARD FAILED: destructionInProgress=\(destructionInProgress) rootKeyNil=\(rootKey == nil) genMatch=\(sessionGeneration == generation) [now=\(sessionGeneration) then=\(generation)] phaseMatch=\(phase == initialPhase) appActive=\(isApplicationActive()) appState=\(String(describing: UIApplication.shared.applicationState))")
             if sessionGeneration == generation {
                 rootKey = nil
                 records = []
             }
             return
         }
+        fdTrace("FD-5 UNLOCKED phase -> unlocked")
         phase = .unlocked
         // Let the library become visible before resuming any long-running import.
         Task { await resumePendingPhotoImport() }
@@ -1251,12 +1283,15 @@ final class VaultAppModel {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         do {
             let unlockedKey = try ConvenienceUnlockStore.unlockWithPIN(pendingPIN)
-            guard canFinishUnlock(generation) else { return }
-            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .pin) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            fdTrace("PIN-1 PIN auth OK, key received")
+            guard canFinishUnlock(generation) else { fdTrace("PIN-1b blocked by canFinishUnlock after auth"); return }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .pin) else { fdTrace("PIN-1c recordSuccessChecked FAILED"); errorMessage = "Security state unavailable. Unlock blocked."; return }
+            fdTrace("PIN-1d recordSuccessChecked OK")
             unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "success", enteredSecret: nil))
             pendingPIN = ""
-            guard canFinishUnlock(generation) else { return }
+            guard canFinishUnlock(generation) else { fdTrace("PIN-1e blocked by canFinishUnlock before finishUnlock"); return }
+            fdTrace("PIN-1f entering finishUnlock (PIN)")
             await finishUnlock(using: unlockedKey)
         } catch {
             guard canFinishUnlock(generation) else { return }
@@ -1309,11 +1344,14 @@ final class VaultAppModel {
         defer { isBusy = false }
         do {
             let unlockedKey = try await faceIDUnlocker.unlock()
-            guard canFinishUnlock(generation) else { return }
-            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .faceID) else { errorMessage = "Security state unavailable. Unlock blocked."; return }
+            fdTrace("FD-1 faceID auth OK, key received")
+            guard canFinishUnlock(generation) else { fdTrace("FD-1b blocked by canFinishUnlock after auth"); return }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .faceID) else { fdTrace("FD-1c recordSuccessChecked FAILED"); errorMessage = "Security state unavailable. Unlock blocked."; return }
+            fdTrace("FD-1d recordSuccessChecked OK")
             unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "success", enteredSecret: nil))
-            guard canFinishUnlock(generation) else { return }
+            guard canFinishUnlock(generation) else { fdTrace("FD-1e blocked by canFinishUnlock before finishUnlock"); return }
+            fdTrace("FD-1f entering finishUnlock (faceID)")
             await finishUnlock(using: unlockedKey)
         } catch is FaceIDAuthenticationFailure {
             guard canFinishUnlock(generation) else { return }
@@ -1335,17 +1373,123 @@ final class VaultAppModel {
             // Biometrics matched but the stored wrapper no longer does: the
             // enrollment changed, so this wrapper is dead. Disable it instead
             // of looping the user through prompts that can never succeed.
-            guard canFinishUnlock(generation) else { return }
+            fdTrace("FD-6 FaceIDWrapperUnavailableFailure (green check but wrapper unreadable)")
+            guard canFinishUnlock(generation) else { fdTrace("FD-6b silent: generation mismatch on wrapper-unavailable"); return }
             faceIDEnabled = false
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "wrapper-unavailable", enteredSecret: nil))
             errorMessage = "Face ID unlock is no longer available — your biometric enrollment changed. Unlock with your password and re-enable Face ID in settings."
         } catch is FaceIDUnavailableFailure {
-            guard canFinishUnlock(generation) else { return }
+            fdTrace("FD-7 FaceIDUnavailableFailure (no sensor / cancelled / not configured)")
+            guard canFinishUnlock(generation) else { fdTrace("FD-7b silent: generation mismatch"); return }
             errorMessage = "Face ID is unavailable right now. Try again, or unlock with your password."
         } catch {
-            guard canFinishUnlock(generation) else { return }
+            fdTrace("FD-8 unexpected error: \(error)")
+            guard canFinishUnlock(generation) else { fdTrace("FD-8b silent: generation mismatch"); return }
             errorMessage = "Face ID unlock failed. Try again, or unlock with your password."
         }
+    }
+
+    /// TODO #1 diagnostic: with the launch arguments
+    /// `-vaulthallaAutoFaceID 1` (and optionally `-vaulthallaAutoCreate 1`),
+    /// drive the Face ID unlock automatically once the app reaches the locked
+    /// phase, so the flow can be reproduced without tapping on a physical
+    /// device. Pair with `xcrun devicectl device simulate biometrics --success`.
+    /// Never active without the explicit flags.
+    /// UI-verification diagnostic: with `-vaulthallaAutoVault 1`, create a fresh
+    /// vault once onboarding appears and stay UNLOCKED, so the Settings screen and
+    /// the Import sheet can be screenshotted without manual tapping.
+    func autoCreateVaultForDiagnostics() async {
+        guard ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoVault") else { return }
+        fdTrace("AV-0 auto-vault diagnostic armed")
+        let pinRequested = ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("-vaulthallaAutoPIN=") }
+        var didSettle = false
+        var didTabSwitched = false
+        var pinDone = !pinRequested
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline && !(didSettle && pinDone) {
+            if phase == .locked, !didSettle,
+               let pwArg = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("-vaulthallaAutoUnlock=") }) {
+                didSettle = true
+                pendingPassword = pwArg.dropFirst("-vaulthallaAutoUnlock=".count).description
+                fdTrace("AV-U auto unlock")
+                await unlock()
+                fdTrace("AV-U2 unlocked -> phase=\(String(describing: phase)) err=\(errorMessage)")
+            }
+            if phase == .onboarding, !didSettle {
+                didSettle = true
+                pendingPassword = "diagnostics-password-123"
+                confirmPassword = "diagnostics-password-123"
+                fdTrace("AV-1 creating vault")
+                await createVault()
+                fdTrace("AV-2 created -> phase=\(String(describing: phase)) err=\(errorMessage)")
+            }
+            // Optional: jump to a specific tab once unlocked (AV-3 args) — works
+            // whether the vault was just created or pre-existing.
+            if phase == .unlocked, !didTabSwitched,
+               let tabArg = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("-vaulthallaTab=") }),
+               let tab = Int(tabArg.dropFirst("-vaulthallaTab=".count)) {
+                didTabSwitched = true
+                selectedTab = tab
+                fdTrace("AV-3 switched to tab \(tab)")
+            }
+            // PIN verification: with -vaulthallaAutoPIN=1234, enable a PIN once
+            // unlocked so "Turn off convenience unlock" appears in Settings.
+            if let pinArg = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("-vaulthallaAutoPIN=") }),
+               phase == .unlocked, !pinEnabled {
+                fdTrace("AV-P enabling PIN")
+                enablePIN(pinArg.dropFirst("-vaulthallaAutoPIN=".count).description)
+                fdTrace("AV-P2 pinEnabled=\(pinEnabled) err=\(errorMessage)")
+                pinDone = pinEnabled
+            }
+            // Toast verification: with -vaulthallaToast set, keep the import toast
+            // visible so its position above the bottom tab bar can be checked.
+            if let toastArg = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("-vaulthallaToast=") }),
+               phase == .unlocked, importMessage != toastArg.dropFirst("-vaulthallaToast=".count).description {
+                importMessage = toastArg.dropFirst("-vaulthallaToast=".count).description
+                fdTrace("AV-4 toast set")
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    func autoFaceIDUnlockForDiagnostics() async {
+        guard ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoFaceID") else { return }
+        fdTrace("FD-0 auto FaceID diagnostic armed autoCreate=\(ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoCreate"))")
+        let autoCreate = ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoCreate")
+        var didCreate = false
+        var lastLog = Date.distantPast
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            if Date().timeIntervalSince(lastLog) > 3 {
+                lastLog = Date()
+                fdTrace("FD-0a state: phase=\(String(describing: phase)) faceIDEnabled=\(faceIDEnabled) isBusy=\(isBusy) didCreate=\(didCreate) appState=\(String(describing: UIApplication.shared.applicationState))")
+            }
+            // Step 1: create a fresh vault + enable Face ID (once).
+            if autoCreate, !didCreate, phase == .onboarding {
+                didCreate = true
+                pendingPassword = "diagnostics-password-123"
+                confirmPassword = "diagnostics-password-123"
+                fdTrace("FD-C0 creating fresh vault + enabling Face ID")
+                await createVault()
+                fdTrace("FD-C1 createVault -> phase=\(String(describing: phase)) err=\(errorMessage)")
+                if phase == .unlocked, rootKey != nil {
+                    await enableFaceID()
+                    fdTrace("FD-C2 faceIDEnabled=\(faceIDEnabled) err=\(errorMessage)")
+                    lock()
+                    fdTrace("FD-C3 locked")
+                }
+                continue
+            }
+            // Step 2: trigger the Face ID unlock once we are locked + Face ID on.
+            if phase == .locked && faceIDEnabled && !isBusy {
+                fdTrace("FD-0b auto-triggering unlockWithFaceID (appState=\(String(describing: UIApplication.shared.applicationState)))")
+                await unlockWithFaceID()
+                fdTrace("FD-0d after unlockWithFaceID -> phase=\(String(describing: phase)) err=\(errorMessage)")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        fdTrace("FD-0c diagnostic timed out")
     }
 
     func loadSecuritySettings() async {
@@ -2279,7 +2423,7 @@ struct ImportOptionsSheet: View {
                 Toggle("Delete originals after successful import", isOn: $deleteOriginals)
                     .font(.body.weight(.medium))
                     .foregroundStyle(.white)
-                    .tint(.white)
+                    .tint(.blue)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
                     .glassEffect(.regular, in: .rect(cornerRadius: 18))
@@ -2358,7 +2502,7 @@ struct MediaLibraryView: View {
     @State private var showPhotosPicker = false
     @State private var showWebImport = false
     @State private var photosSelection: [PhotosPickerItem] = []
-    @State private var deleteOriginals = true
+    @State private var deleteOriginals = false
     @State private var selectedGroupIDs = Set<String>()
     @State private var showGroupDeleteConfirmation = false
     @State private var selectionMode = false
@@ -2532,7 +2676,12 @@ struct MediaLibraryView: View {
                         .font(.footnote)
                         .padding()
                         .background(.thinMaterial, in: Capsule())
-                        .padding()
+                        .padding(.horizontal)
+                        .padding(.top)
+                        // Clear the floating bottom tab bar (Images/Videos/Settings
+                        // pill), which sits at the page bottom and would otherwise
+                        // cover the toast.
+                        .padding(.bottom, 68)
                 }
             }
         }
@@ -4133,6 +4282,8 @@ struct SettingsView: View {
                         Button("Turn off convenience unlock", systemImage: "power", role: .destructive) {
                             model.disableConvenienceUnlock()
                         }
+                        .tint(.red)
+                        .foregroundStyle(.red)
                     }
                     Stepper("PIN failures: \(model.pinFailureThreshold)", value: Binding(
                         get: { model.pinFailureThreshold },
@@ -4159,11 +4310,12 @@ struct SettingsView: View {
                         .onChange(of: auditLoggingEnabled) { _, enabled in
                             Task { await model.configureAuditLogging(enabled) }
                         }
-                    Button("Security Activity", systemImage: "list.bullet.clipboard") {
-                        showAuditActivity = true
-                        Task { await model.loadAuditEvents() }
+                    if auditLoggingEnabled {
+                        Button("Security Activity", systemImage: "list.bullet.clipboard") {
+                            showAuditActivity = true
+                            Task { await model.loadAuditEvents() }
+                        }
                     }
-                    .disabled(!auditLoggingEnabled)
                     Picker("History", selection: $auditHistoryLimit) {
                         Text("Unlimited").tag(0)
                         Text("50 entries").tag(50)
@@ -4250,6 +4402,7 @@ struct SettingsView: View {
                         showDestroyConfirmation = true
                     }
                     .tint(.red)
+                    .foregroundStyle(.red)
                 } header: {
                     Text("Vault")
                 } footer: {

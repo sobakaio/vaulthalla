@@ -4,31 +4,13 @@ import CryptoKit
 import ImageIO
 import Observation
 
-/// A one-shot box that lets a synchronous thread wait for an async result.
-/// The wait only ever parks this delegate-queue thread for the duration of one
-/// bounded chunk read; the response is delivered by the producing Task.
-private final class ResultBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private let semaphore = DispatchSemaphore(value: 0)
-    private var value: (data: Data?, error: Error?)?
-    private var done = false
-
-    func finish(_ value: (data: Data?, error: Error?)) {
-        lock.lock()
-        if !done {
-            self.value = value
-            done = true
-        }
-        lock.unlock()
-        semaphore.signal()
-    }
-
-    func wait() -> (data: Data?, error: Error?) {
-        semaphore.wait()
-        lock.lock()
-        defer { lock.unlock() }
-        return value ?? (data: nil, error: NSError(domain: "VaultVideoAssetProvider", code: -2))
-    }
+/// Holds the two AVFoundation request objects so a background task can
+/// complete a range read. Both are only ever touched on the provider's
+/// serial delegate queue, so the wrapper just suppresses the (false)
+/// cross-actor warning.
+private struct PendingRangeRequest: @unchecked Sendable {
+    let request: AVAssetResourceLoadingRequest
+    let dataRequest: AVAssetResourceLoadingDataRequest
 }
 
 /// Serves a decrypted vault video to AVFoundation strictly in memory.
@@ -112,12 +94,41 @@ final class VaultVideoAssetProvider: NSObject, AVAssetResourceLoaderDelegate, @u
               !loadingRequest.isCancelled else {
             return false
         }
-        // The loader holds the delegate weakly and the request transiently;
-        // keep a strong reference for the duration of the async read.
-        pendingRequests.lock()
-        activeRequests.append(loadingRequest)
-        pendingRequests.unlock()
-        serve(loadingRequest)
+        // Content information must be set before this callback returns.
+        if let infoRequest = loadingRequest.contentInformationRequest {
+            infoRequest.contentType = Self.contentType(for: mimeType)
+            infoRequest.contentLength = byteCount
+            infoRequest.isByteRangeAccessSupported = true
+            infoRequest.isEntireLengthAvailableOnDemand = true
+        }
+        // Read the range description on the delegate queue (the only thread
+        // allowed to touch the request) and hand the decryption to a
+        // background task.
+        //
+        // This queue must never park while waiting for a read: it is where
+        // the loader delivers every other request and cancellation for this
+        // asset. Parking it serialized all range reads behind one another —
+        // the prefetch buffer drained (choppy playback after a few seconds)
+        // and loader callbacks such as didCancel and seeks queued up behind
+        // a slow read (play/pause appeared unresponsive).
+        if let dataRequest = loadingRequest.dataRequest {
+            let offset = dataRequest.requestedOffset
+            // Clamp: the demuxer may probe just past EOF, and an "all data
+            // to end" request reports requestedLength as NSIntegerMax.
+            let length = Swift.max(0, Swift.min(Int64(dataRequest.requestedLength), byteCount - offset))
+            // The loader holds the delegate weakly and the request
+            // transiently; keep strong references for the duration of the
+            // async read.
+            pendingRequests.lock()
+            activeRequests.append(loadingRequest)
+            pendingRequests.unlock()
+            let pending = PendingRangeRequest(request: loadingRequest, dataRequest: dataRequest)
+            Task {
+                await self.serve(pending: pending, offset: offset, length: length)
+            }
+        } else {
+            loadingRequest.finishLoading()
+        }
         return true
     }
 
@@ -133,50 +144,40 @@ final class VaultVideoAssetProvider: NSObject, AVAssetResourceLoaderDelegate, @u
         pendingRequests.unlock()
     }
 
-    private func serve(_ loadingRequest: AVAssetResourceLoadingRequest) {
-        guard !loadingRequest.isCancelled else {
-            release(loadingRequest)
-            loadingRequest.finishLoading()
-            return
-        }
-        if let infoRequest = loadingRequest.contentInformationRequest {
-            infoRequest.contentType = Self.contentType(for: mimeType)
-            infoRequest.contentLength = byteCount
-            infoRequest.isByteRangeAccessSupported = true
-            infoRequest.isEntireLengthAvailableOnDemand = true
-        }
-        guard let dataRequest = loadingRequest.dataRequest else {
-            release(loadingRequest)
-            loadingRequest.finishLoading()
-            return
-        }
-        let offset = dataRequest.requestedOffset
-        // Clamp: the demuxer may probe just past EOF, and an "all data to end"
-        // request reports requestedLength as NSIntegerMax.
-        let length = Swift.max(0, Swift.min(Int64(dataRequest.requestedLength), byteCount - offset))
-        // Serve synchronously on this serial delegate queue: the loader
-        // spins its own run loop until finishLoading, so the response must not
-        // depend on any other actor or thread being scheduled. The read path
-        // (block-store actors) never touches this queue, so parking it here
-        // cannot deadlock.
-        let box = ResultBox()
-        Task {
+    /// Decrypts one bounded range off the delegate queue and delivers it
+    /// back on that same queue. Ranges at or past EOF (demuxer probes) are
+    /// answered with empty data instead of an error so a probe just beyond
+    /// the end cannot fail the asset.
+    private func serve(pending: PendingRangeRequest, offset: Int64, length: Int64) async {
+        let result: (data: Data?, error: Error?)
+        if offset >= byteCount {
+            result = (Data(), nil)
+        } else {
             do {
-                let data = try await self.readRange(offset, length)
-                box.finish((data: data, error: nil))
+                let data = try await readRange(offset, length)
+                result = (data: data, error: nil)
             } catch {
-                box.finish((data: nil, error: error))
+                result = (data: nil, error: error)
             }
         }
-        let result = box.wait()
-        if let data = result.data {
-            dataRequest.respond(with: data)
-            loadingRequest.finishLoading()
-        } else {
-            let error = result.error ?? NSError(domain: "VaultVideoAssetProvider", code: -1)
-            loadingRequest.finishLoading(with: error)
+        // respond/finishLoading must run on the delegate queue; the read has
+        // already completed here, so this only adds a short hop and never
+        // parks the queue.
+        delegateQueue.async {
+            guard !pending.request.isCancelled else {
+                // didCancel already released and finished this request.
+                return
+            }
+            if let data = result.data {
+                pending.dataRequest.respond(with: data)
+            }
+            if let error = result.error {
+                pending.request.finishLoading(with: error)
+            } else {
+                pending.request.finishLoading()
+            }
+            self.release(pending.request)
         }
-        release(loadingRequest)
     }
 }
 

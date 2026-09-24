@@ -345,6 +345,72 @@ private static let videoFixtureBase64 =
         #expect(empty.isEmpty)
     }
 
+    /// Regression for the non-blocking resource loader: a real AVPlayer must
+    /// stream the whole fixture through the provider and reach the end.
+    /// The async serve path must respond to every range and call
+    /// finishLoading exactly once — a missed or doubled finish stalls or
+    /// crashes AVPlayer, and a parked delegate queue used to freeze
+    /// playback after the prefetch buffer drained.
+    @Test func inMemoryVideoAssetPlaysToCompletion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let source = try Self.makeVideoFixture(at: directory)
+
+        let store = EncryptedBlockStore(rootDirectory: directory.appendingPathComponent("vault", isDirectory: true))
+        let rootKey = SymmetricKey(size: .bits256)
+        guard let record = try await store.importFile(
+            at: source,
+            filename: source.lastPathComponent,
+            mimeType: "video/mp4",
+            rootKey: rootKey,
+            segmentCapacity: SegmentCapacity.megabytes50.bytes
+        ) else {
+            Issue.record("Video import did not return a media record.")
+            return
+        }
+
+        let delivered = NSLock()
+        var deliveredBytes = 0
+        let provider = VaultVideoAssetProvider(
+            mimeType: record.mimeType,
+            byteCount: record.byteCount
+        ) { offset, length in
+            let data = try await store.plaintext(for: record, byteRange: offset..<(offset + length))
+            delivered.lock()
+            deliveredBytes += data.count
+            delivered.unlock()
+            return data
+        }
+        let asset = try await provider.makeAsset()
+        #expect(try await asset.load(.isPlayable))
+
+        let item = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = false
+        var finished = false
+        let ended = DispatchSemaphore(value: 0)
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: nil
+        ) { _ in
+            finished = true
+            ended.signal()
+        }
+        player.play()
+        let result = ended.wait(timeout: .now() + 60)
+        NotificationCenter.default.removeObserver(observer)
+        player.pause()
+
+        #expect(result == .success, "Playback did not reach the end through the in-memory loader.")
+        #expect(finished)
+        delivered.lock()
+        let total = deliveredBytes
+        delivered.unlock()
+        #expect(total > 0, "The loader must have served at least one byte range.")
+    }
+
 
     // MARK: - AUDIT #8 — interrupted pre-header creation
 
