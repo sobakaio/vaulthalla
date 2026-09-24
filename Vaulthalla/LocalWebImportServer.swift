@@ -54,14 +54,9 @@ final class LocalWebImportServer {
     private var previousIdleTimerState: Bool?
 
     func start(rootKey: SymmetricKey) {
-        #if !DEBUG || !VAULTHALLA_UNSAFE_HTTP_IMPORT
-        // Plain HTTP exposes the PIN, token and media to an active LAN attacker.
-        // Keep it off in every normal build. An explicit development-only Swift
-        // flag may enable the insecure listener for controlled testing; it must
-        // never be enabled for distribution or treated as a security feature.
-        state = .failed("Web Import is unavailable until secure transport is supported.")
-        return
-        #else
+        // Plain HTTP exposes the PIN, token and media to an active LAN
+        // attacker. A secure transport is still pending; the UI warns the
+        // user until one is implemented.
         stop()
         previousIdleTimerState = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
@@ -91,7 +86,6 @@ final class LocalWebImportServer {
             token = ""
             pairingPIN = ""
         }
-        #endif
     }
 
     private func installListener(on port: NWEndpoint.Port) throws {

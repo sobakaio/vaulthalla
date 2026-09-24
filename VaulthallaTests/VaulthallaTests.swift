@@ -4,20 +4,22 @@ import CryptoKit
 @testable import Vaulthalla
 
 struct VaulthallaTests {
-    #if !VAULTHALLA_UNSAFE_HTTP_IMPORT
-    @Test @MainActor func defaultBuildRefusesPlaintextWebImport() {
+    @Test @MainActor func webImportServerStartsInDefaultBuild() async {
         let server = LocalWebImportServer()
         server.start(rootKey: SymmetricKey(size: .bits256))
-        guard case .failed = server.state else {
-            Issue.record("Plaintext Web Import listener must be disabled by default")
-            server.stop()
+        defer { server.stop() }
+        for _ in 0..<100 {
+            if case .running = server.state { break }
+            if case .failed = server.state { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard case .running = server.state else {
+            Issue.record("Web Import listener should start in the default build")
             return
         }
-        #expect(server.importURL == nil)
-        #expect(server.pairingPIN.isEmpty)
-        server.stop()
+        #expect(server.importURL?.scheme == "http")
+        #expect(server.pairingPIN.count == 8)
     }
-    #endif
 
     @Test func passwordKeyIsDeterministicForSameInputs() throws {
         let salt = Data(repeating: 7, count: 32)
