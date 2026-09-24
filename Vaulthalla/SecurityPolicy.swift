@@ -172,13 +172,21 @@ enum BiometricFailure: Error, Equatable {
 /// §42 — abstraction over the biometric-gated unlock so the Face ID state machine
 /// (success, failure counting, lockout) is testable without biometric hardware.
 protocol FaceIDUnlocking: Sendable {
-    /// Throws `FaceIDAuthenticationFailure` when the biometrics do not match and
-    /// `FaceIDUnavailableFailure` for everything else (no sensor, cancelled, not configured).
+    /// Throws `FaceIDAuthenticationFailure` when the biometrics do not match,
+    /// `FaceIDWrapperUnavailableFailure` when biometrics succeeded but the
+    /// Keychain item they guard can no longer be read, and
+    /// `FaceIDUnavailableFailure` for everything else (no sensor, cancelled,
+    /// not configured).
     func unlock() async throws -> SymmetricKey
 }
 
 struct FaceIDAuthenticationFailure: Error {}
 struct FaceIDUnavailableFailure: Error {}
+/// The biometric prompt succeeded, but the biometry-gated Keychain item could
+/// not be read afterwards. With `.biometryCurrentSet` access control this is
+/// definitive: the stored enrollment no longer matches the current one (e.g.
+/// Face ID was re-registered), so the wrapper can never unlock again.
+struct FaceIDWrapperUnavailableFailure: Error {}
 
 struct LiveFaceIDUnlocker: FaceIDUnlocking {
     func unlock() async throws -> SymmetricKey {
@@ -187,7 +195,10 @@ struct LiveFaceIDUnlocker: FaceIDUnlocking {
             do {
                 return try ConvenienceUnlockStore.unlockWithFaceID(using: context)
             } catch {
-                throw FaceIDUnavailableFailure()
+                // Biometrics just succeeded, so the failure is the Keychain
+                // item itself — not the user. The wrapper is permanently
+                // unusable with the current enrollment.
+                throw FaceIDWrapperUnavailableFailure()
             }
         case .failure(.code(.authenticationFailed)):
             throw FaceIDAuthenticationFailure()

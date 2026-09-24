@@ -641,6 +641,12 @@ final class VaultAppModel {
     /// Keep the lock screen visible until the encrypted index is authenticated and ready.
     private func finishUnlock(using key: SymmetricKey) async {
         guard await requireDeviceBinding() else { return }
+        // Every successful unlock (password, PIN, Face ID) must re-arm store
+        // access: lock() revokes it on backgrounding, and the convenience
+        // paths do not re-arm it the way store.unlock() does. Without this,
+        // the first index load after a background lock fails and PIN/Face ID
+        // look broken ("Vault Integrity Error" / endless Face ID loop).
+        await store.activateAccess()
         let generation = sessionGeneration
         let initialPhase = phase
         rootKey = key
@@ -1269,9 +1275,20 @@ final class VaultAppModel {
             } else {
                 errorMessage = "Face ID authentication failed."
             }
+        } catch is FaceIDWrapperUnavailableFailure {
+            // Biometrics matched but the stored wrapper no longer does: the
+            // enrollment changed, so this wrapper is dead. Disable it instead
+            // of looping the user through prompts that can never succeed.
+            guard canFinishUnlock(generation) else { return }
+            faceIDEnabled = false
+            await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "wrapper-unavailable", enteredSecret: nil))
+            errorMessage = "Face ID unlock is no longer available — your biometric enrollment changed. Unlock with your password and re-enable Face ID in settings."
+        } catch is FaceIDUnavailableFailure {
+            guard canFinishUnlock(generation) else { return }
+            errorMessage = "Face ID is unavailable right now. Try again, or unlock with your password."
         } catch {
             guard canFinishUnlock(generation) else { return }
-            errorMessage = "Face ID is unavailable."
+            errorMessage = "Face ID unlock failed. Try again, or unlock with your password."
         }
     }
 
@@ -1818,6 +1835,11 @@ struct LockView: View {
 
 struct OnboardingView: View {
     @Bindable var model: VaultAppModel
+    /// Presentation state is mirrored into real @State and armed in onAppear.
+    /// An .alert whose isPresented is already true when the view is installed
+    /// is never presented until the next re-render (the "message only appears
+    /// after I touch the password field" bug).
+    @State private var showDestructionAlert = false
     @FocusState private var focusedField: OnboardingField?
 
     enum OnboardingField { case password, confirm }
@@ -1935,11 +1957,17 @@ struct OnboardingView: View {
             }
             .tint(VaultUI.accent)
             .toolbar(.hidden, for: .navigationBar)
-            .alert("Vault destroyed", isPresented: Binding(
-                get: { !model.destructionMessage.isEmpty },
-                set: { if !$0 { model.destructionMessage = "" } }
-            )) {
-                Button("OK") { model.destructionMessage = "" }
+            .onAppear {
+                showDestructionAlert = !model.destructionMessage.isEmpty
+            }
+            .onChange(of: model.destructionMessage) { _, message in
+                showDestructionAlert = !message.isEmpty
+            }
+            .alert("Vault destroyed", isPresented: $showDestructionAlert) {
+                Button("OK") {
+                    showDestructionAlert = false
+                    model.destructionMessage = ""
+                }
             } message: {
                 Text(model.destructionMessage)
             }
@@ -4171,6 +4199,7 @@ struct SettingsView: View {
                     Button("Destroy vault", systemImage: "trash", role: .destructive) {
                         showDestroyConfirmation = true
                     }
+                    .tint(.red)
                 } header: {
                     Text("Vault")
                 } footer: {

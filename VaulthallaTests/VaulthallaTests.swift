@@ -73,6 +73,79 @@ struct VaulthallaTests {
         }
     }
 
+    /// Regression: after the scene handler locks on backgrounding (which
+    /// revokes block-store access), a convenience unlock must re-arm access
+    /// through finishUnlock and load the index — previously PIN failed with
+    /// "Vault Integrity Error" and Face ID looped because only store.unlock()
+    /// (password path) called activateAccess.
+    ///
+    /// Runs WITHOUT the global Keychain device secret: the vault is a
+    /// header-less block store with a seeded (empty) index, so
+    /// requireDeviceBinding returns true without touching Keychain. The unlock
+    /// therefore reaches the "audit privacy cleanup" step (no header to verify)
+    /// instead of .unlocked. The regression signal is the ABSENCE of the
+    /// "Vault Integrity Error" that the access-revocation bug produced.
+    @Test(.serialized) @MainActor func convenienceUnlockWorksAfterBackgroundLockRevokesAccess() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let rootKey = SymmetricKey(size: .bits256)
+        let store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        // Seed a valid (empty) encrypted index into the store's block store so
+        // loadIndex has something authenticated to read. No header, no device
+        // secret, no creation journal — the Keychain is never touched.
+        let seeder = EncryptedBlockStore(rootDirectory: directory.appendingPathComponent("Vaulthalla", isDirectory: true))
+        try await seeder.initialize(using: rootKey, auditPrivateKey: Curve25519.KeyAgreement.PrivateKey().rawRepresentation)
+
+        let model = VaultAppModel()
+        model.store = store
+        model.rootKey = rootKey
+        model.phase = .locked
+        model.isApplicationActive = { true }
+        model.attemptStore = AttemptStateStore(account: "convenience-lock-test-\(UUID().uuidString)")
+        model.faceIDEnabled = true
+        model.faceIDUnlocker = ScriptedFaceIDUnlocker(results: [.success(rootKey)])
+
+        // Simulate the background lock: the scene handler revokes store access.
+        await store.revokeAccess()
+        #expect(model.phase == .locked)
+
+        // Biometric success after the background lock must re-arm access and
+        // load the index — not fail with the access-revocation Integrity Error.
+        await model.unlockWithFaceID()
+        #expect(!model.errorMessage.contains("Integrity"))
+    }
+
+    /// Regression (TODO Bug #1): when biometrics match but the biometry-gated
+    /// Keychain wrapper can no longer be read (Face ID re-enrolled), the Face ID
+    /// unlocker throws FaceIDWrapperUnavailableFailure. The app must stop
+    /// looping the user through prompts that can never succeed: disable Face ID
+    /// and show the specific "enrollment changed" message — not a generic
+    /// "unavailable" that invites endless retries.
+    @Test(.serialized) @MainActor func faceIDWrapperUnavailableDisablesFaceIDWithClearMessage() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = VaultStore(fileManager: RedirectedFileManager(replacement: directory))
+        let model = VaultAppModel()
+        model.store = store
+        model.phase = .locked
+        model.isApplicationActive = { true }
+        model.attemptStore = AttemptStateStore(account: "faceid-wrapper-test-\(UUID().uuidString)")
+        model.faceIDEnabled = true
+        // Biometrics succeeded, but the Keychain read behind them failed.
+        model.faceIDUnlocker = ScriptedFaceIDUnlocker(results: [.failure(FaceIDWrapperUnavailableFailure())])
+
+        await model.unlockWithFaceID()
+
+        #expect(model.faceIDEnabled == false)
+        #expect(model.errorMessage.contains("biometric enrollment changed"))
+    }
+
     @Test func passwordKeyIsDeterministicForSameInputs() throws {
         let salt = Data(repeating: 7, count: 32)
         let first = try PasswordKDF.deriveKey(password: "correct horse battery", salt: salt, iterations: 100_000)

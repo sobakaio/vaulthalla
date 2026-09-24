@@ -203,6 +203,10 @@ actor VaultStore {
         await blockStore.revokeAccess()
     }
 
+    func activateAccess() async {
+        await blockStore.activateAccess()
+    }
+
     func unlock(password: String) async throws -> SymmetricKey {
         guard hasVault() else { throw VaultError.noVault }
         let header = try loadHeader()

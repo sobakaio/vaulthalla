@@ -6,7 +6,9 @@ import Security
 
 struct StorageTests {
     #if targetEnvironment(simulator)
-    @Test func creationJournalRecoversAfterRestartWithoutReplacingIndex() async throws {
+    // Writes the global Keychain device secret, so it must run in the serial
+    // domain alongside the other device-secret tests to avoid SecItem races.
+    @Test(.serialized) func creationJournalRecoversAfterRestartWithoutReplacingIndex() async throws {
         let manager = FileManager.default
         let appSupport = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let root = appSupport.appendingPathComponent("Vaulthalla")
@@ -83,6 +85,10 @@ struct StorageTests {
         try await fresh.createVault(password: password, segmentCapacity: .megabytes50)
         let integrityModel = await MainActor.run { VaultAppModel() }
         await MainActor.run { integrityModel.store = fresh }
+        // The unlock path (finishUnlock) is gated by canFinishUnlock, which
+        // requires the app to be active. The test host is not foreground-active,
+        // so override it to exercise the real unlock -> tamper -> destroy flow.
+        await MainActor.run { integrityModel.isApplicationActive = { true } }
         await integrityModel.load()
         await MainActor.run { integrityModel.pendingPassword = "wrong-password" }
         await integrityModel.unlock()
