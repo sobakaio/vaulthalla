@@ -21,6 +21,58 @@ struct VaulthallaTests {
         #expect(server.pairingPIN.count == 8)
     }
 
+    @Test @MainActor func webImportResumesWhenSheetStillVisibleAfterSceneInactive() async {
+        let model = VaultAppModel()
+        model.rootKey = SymmetricKey(size: .bits256)
+        model.webImportSheetVisible = true
+        model.startWebImport()
+        await webImportSettled(model, expect: .running)
+        // Simulates the scenePhase == .inactive handler (e.g. a system
+        // permission prompt covering the sheet on a fresh install).
+        model.webImportServer.stop()
+        #expect(model.webImportServer.state == .stopped)
+        // Simulates scenePhase == .active with the sheet still on screen.
+        model.webImportResumeIfSheetVisible()
+        await webImportSettled(model, expect: .running)
+        model.webImportServer.stop()
+    }
+
+    @Test @MainActor func webImportDoesNotResumeWhenSheetClosed() async {
+        let model = VaultAppModel()
+        model.rootKey = SymmetricKey(size: .bits256)
+        model.webImportSheetVisible = true
+        model.startWebImport()
+        await webImportSettled(model, expect: .running)
+        model.webImportSheetVisible = false
+        model.webImportServer.stop()
+        model.webImportResumeIfSheetVisible()
+        #expect(model.webImportServer.state == .stopped)
+    }
+
+    @Test @MainActor func webImportRapidStopStartStaysConsistent() async {
+        let model = VaultAppModel()
+        model.rootKey = SymmetricKey(size: .bits256)
+        // Rapid start/stop/start (SwiftUI onAppear/onDisappear double-fire)
+        // must not corrupt the state machine with stale listener callbacks.
+        for _ in 0..<3 {
+            model.startWebImport()
+            await model.stopWebImport()
+            model.startWebImport()
+            await webImportSettled(model, expect: .running)
+        }
+        #expect(model.webImportServer.state == .running)
+        model.webImportServer.stop()
+    }
+
+    @MainActor
+    private func webImportSettled(_ model: VaultAppModel, expect state: LocalWebImportServer.State) async {
+        for _ in 0..<200 {
+            if model.webImportServer.state == state { return }
+            if case .failed = model.webImportServer.state { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
     @Test func passwordKeyIsDeterministicForSameInputs() throws {
         let salt = Data(repeating: 7, count: 32)
         let first = try PasswordKDF.deriveKey(password: "correct horse battery", salt: salt, iterations: 100_000)

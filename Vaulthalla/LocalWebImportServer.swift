@@ -42,6 +42,10 @@ final class LocalWebImportServer {
 
     private let store = VaultStore.shared
     private var listener: NWListener?
+    /// Monotonic token so state/connection callbacks from a cancelled or
+    /// replaced listener are ignored instead of corrupting the current
+    /// session (rapid start/stop/start can leave stale callbacks in flight).
+    private var listenerGeneration = 0
     private var token = ""
     private var failedPairings = 0
     private static let maximumPairingAttempts = 8
@@ -72,7 +76,8 @@ final class LocalWebImportServer {
 
         do {
             usingPreferredPort = true
-            try installListener(on: NWEndpoint.Port(rawValue: 80) ?? .any)
+            listenerGeneration &+= 1
+            try installListener(on: NWEndpoint.Port(rawValue: 80) ?? .any, generation: listenerGeneration)
             expiryTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(Self.sessionDuration))
                 guard !Task.isCancelled else { return }
@@ -88,16 +93,23 @@ final class LocalWebImportServer {
         }
     }
 
-    private func installListener(on port: NWEndpoint.Port) throws {
+    private func installListener(on port: NWEndpoint.Port, generation: Int) throws {
         let listener = try NWListener(using: .tcp, on: port)
         listener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor [weak self] in
-                self?.accept(connection)
+                // A stale listener (already cancelled/replaced) must never
+                // feed connections into the current session.
+                guard let self, generation == self.listenerGeneration else {
+                    connection.cancel()
+                    return
+                }
+                self.accept(connection)
             }
         }
         listener.stateUpdateHandler = { [weak self] listenerState in
             Task { @MainActor [weak self] in
-                self?.handle(listenerState)
+                guard let self, generation == self.listenerGeneration else { return }
+                self.handle(listenerState)
             }
         }
         self.listener = listener
@@ -113,6 +125,7 @@ final class LocalWebImportServer {
         state = .stopping
         expiryTask?.cancel()
         expiryTask = nil
+        listenerGeneration &+= 1
         listener?.cancel()
         listener = nil
         connections.values.forEach { $0.cancel() }
@@ -148,21 +161,22 @@ final class LocalWebImportServer {
             let portSuffix = port == 80 ? "" : ":\(port)"
             importURL = URL(string: "http://\(address)\(portSuffix)")
             state = .running
-        case .failed:
+        case .failed(let error):
             if usingPreferredPort {
                 usingPreferredPort = false
                 listener?.cancel()
                 listener = nil
+                listenerGeneration &+= 1
                 do {
-                    try installListener(on: .any)
+                    try installListener(on: .any, generation: listenerGeneration)
                     return
                 } catch {
-                    state = .failed("Could not start the local server.")
+                    state = .failed("Could not start the local server. \(error.localizedDescription)")
                     stop()
                     return
                 }
             }
-            state = .failed("The local network listener stopped unexpectedly.")
+            state = .failed("The local network listener stopped unexpectedly. \(error.localizedDescription)")
             stop()
         case .cancelled:
             if state != .stopped { state = .stopped }

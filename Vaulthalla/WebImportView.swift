@@ -118,11 +118,13 @@ struct WebImportView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
             .tint(.white)
             .onAppear {
+                model.webImportSheetVisible = true
                 model.startWebImport()
             }
             .onDisappear {
                 // Stops the session and reloads the index so imported files
                 // appear in the grid immediately after the dialog closes.
+                model.webImportSheetVisible = false
                 Task { await model.stopWebImport() }
             }
         }

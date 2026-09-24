@@ -39,6 +39,11 @@ struct ContentView: View {
                 model.lock()
             } else if phase == .active {
                 privacyCover = false
+                // A system permission prompt (or backgrounding) briefly
+                // transitions the scene to .inactive, which stopped the
+                // import server. If the import sheet is still on screen,
+                // resume the session instead of leaving it permanently off.
+                model.webImportResumeIfSheetVisible()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
@@ -140,6 +145,11 @@ final class VaultAppModel {
     var attemptStore: AttemptStateStore = .shared
     var faceIDUnlocker: any FaceIDUnlocking = LiveFaceIDUnlocker()
     let webImportServer = LocalWebImportServer()
+    /// True while the Web Import sheet is on screen (set by WebImportView's
+    /// onAppear/onDisappear). Used to resume the server when the scene
+    /// becomes active again after a transient .inactive (e.g. a system
+    /// permission prompt covering the sheet).
+    var webImportSheetVisible = false
     private var loaded = false
     private var sessionGeneration: UInt64 = 0
     private var destructionInProgress = false
@@ -573,8 +583,10 @@ final class VaultAppModel {
         }
         // Keep the app (and its local server) alive while the session runs
         // in the background — uploads keep arriving when the user is in Safari.
+        // (Notification permission is requested at app launch, not here: a
+        // prompt covering this sheet would transition the scene to
+        // .inactive and stop the server right after its first start.)
         WebImportBackgroundSession.shared.begin()
-        requestNotificationAuthorization()
         webImportServer.start(rootKey: rootKey)
     }
 
@@ -589,6 +601,17 @@ final class VaultAppModel {
         webImportServer.uploadedCount = 0
         await refreshIndex()
         await loadStorageStatistics()
+    }
+
+    /// Resumes Web Import when the scene becomes active again while the
+    /// import sheet is still on screen. A system permission prompt (or
+    /// backgrounding) briefly transitions the scene to .inactive, which
+    /// stops the server; without this resume the first start on a fresh
+    /// install would be left permanently "off" until a manual restart.
+    func webImportResumeIfSheetVisible() {
+        guard webImportSheetVisible,
+              case .stopped = webImportServer.state else { return }
+        startWebImport()
     }
 
     @discardableResult
