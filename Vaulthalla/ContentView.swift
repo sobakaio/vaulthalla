@@ -1826,18 +1826,21 @@ struct VaultPrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.body.weight(.semibold))
-            .foregroundStyle(isEnabled ? .white : .white.opacity(0.72))
+            // Enabled: white on the fixed dark-blue gradient (readable in both
+            // schemes). Disabled: semantic colors so the label stays readable
+            // on a light or dark page background (TODO #8).
+            .foregroundStyle(isEnabled ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
             .padding(.horizontal, 18)
             .frame(minHeight: 50)
             .background(
                 isEnabled
                     ? AnyShapeStyle(VaultUI.accentGradient)
-                    : AnyShapeStyle(Color.white.opacity(0.18)),
+                    : AnyShapeStyle(.quaternary),
                 in: Capsule()
             )
             .overlay {
                 Capsule()
-                    .stroke(.white.opacity(isEnabled ? 0.12 : 0.08), lineWidth: 1)
+                    .stroke(isEnabled ? AnyShapeStyle(.white.opacity(0.12)) : AnyShapeStyle(.quaternary), lineWidth: 1)
             }
             .opacity(configuration.isPressed ? 0.82 : 1)
             .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
@@ -2243,7 +2246,9 @@ struct MainVaultView: View {
                 Text(title)
                     .font(.caption2)
             }
-            .foregroundStyle(model.selectedTab == tag ? .white : .white.opacity(0.6))
+            // Semantic colors: white/gray on dark glass, black/gray on light
+            // glass, so the pill stays readable in both color schemes (TODO #8).
+            .foregroundStyle(model.selectedTab == tag ? .primary : .secondary)
             .frame(width: 72)
             .contentShape(Rectangle())
         }
@@ -2609,11 +2614,9 @@ struct MediaLibraryView: View {
                             .accessibilityIdentifier("menuImportButton")
                         } label: {
                             Image(systemName: "ellipsis.circle")
-                                .foregroundStyle(.white)
+                                .foregroundStyle(.primary)
                                 .accessibilityIdentifier("moreMenuButton")
                         }
-                        .environment(\.colorScheme, .dark)
-                        .tint(.white)
                     }
                 }
             }
@@ -2877,11 +2880,9 @@ struct GroupDetailView: View {
                             .accessibilityIdentifier("menuSelectAllButton")
                         } label: {
                             Image(systemName: "ellipsis.circle")
-                                .foregroundStyle(.white)
+                                .foregroundStyle(.primary)
                                 .accessibilityIdentifier("groupMoreMenuButton")
                         }
-                        .environment(\.colorScheme, .dark)
-                        .tint(.white)
                     } else {
                         HStack(spacing: 4) {
                             Text("\(selectedIDs.count) selected")
