@@ -1785,7 +1785,9 @@ enum VaultGridColumns {
 }
 
 enum VaultUI {
-    static let accent = Color(red: 0.10, green: 0.46, blue: 0.98)
+    // System blue keeps every accent in the app (tints, icons, checkmarks,
+    // progress) identical to the platform accent in both light and dark.
+    static let accent: Color = .blue
     static let accentGradient = LinearGradient(
         colors: [Color(red: 0.12, green: 0.57, blue: 1.0), Color(red: 0.08, green: 0.30, blue: 0.92)],
         startPoint: .topLeading,
@@ -2617,6 +2619,9 @@ struct MediaLibraryView: View {
                                 .foregroundStyle(.primary)
                                 .accessibilityIdentifier("moreMenuButton")
                         }
+                        // Theme color, not accent blue: the ellipsis and the
+                        // menu-item icon match the label text in both themes.
+                        .tint(.primary)
                     }
                 }
             }
@@ -2883,6 +2888,9 @@ struct GroupDetailView: View {
                                 .foregroundStyle(.primary)
                                 .accessibilityIdentifier("groupMoreMenuButton")
                         }
+                        // Theme color, not accent blue: the ellipsis and the
+                        // menu-item icons match the label text in both themes.
+                        .tint(.primary)
                     } else {
                         HStack(spacing: 4) {
                             Text("\(selectedIDs.count) selected")
@@ -4274,10 +4282,13 @@ struct SettingsView: View {
                     Button("Use Face ID", systemImage: "faceid") {
                         Task { await model.enableFaceID() }
                     }
+                    // Blue action row: icon and label share the same color.
+                    .foregroundStyle(.blue)
                     .disabled(model.faceIDEnabled)
                     Button("Use PIN", systemImage: "circle.grid.2x2.fill") {
                         showPINEntry = true
                     }
+                    .foregroundStyle(.blue)
                     .disabled(model.pinEnabled)
                     if model.pinEnabled || model.faceIDEnabled {
                         Button("Turn off convenience unlock", systemImage: "power", role: .destructive) {
@@ -4297,6 +4308,7 @@ struct SettingsView: View {
                     Button("Change master password", systemImage: "key.fill") {
                         showPasswordChange = true
                     }
+                    .foregroundStyle(.blue)
                 } header: {
                     Text("Quick unlock")
                 } footer: {
@@ -4316,6 +4328,7 @@ struct SettingsView: View {
                             showAuditActivity = true
                             Task { await model.loadAuditEvents() }
                         }
+                        .foregroundStyle(.blue)
                     }
                     Picker("History", selection: $auditHistoryLimit) {
                         Text("Unlimited").tag(0)
@@ -4348,13 +4361,16 @@ struct SettingsView: View {
                     Button("Verify vault", systemImage: "checkmark.shield") {
                         model.scheduleVerify()
                     }
+                    .foregroundStyle(.blue)
                     Button("Compact storage", systemImage: "arrow.down.right.and.arrow.up.left") {
                         model.scheduleCompact()
                     }
+                    .foregroundStyle(.blue)
                     if model.missingPreviewCount > 0 {
                         Button("Generate missing previews (\(model.missingPreviewCount))", systemImage: "photo.badge.plus") {
                             model.generateMissingPreviews()
                         }
+                        .foregroundStyle(.blue)
                     }
                 } header: {
                     Text("Storage")
@@ -4399,6 +4415,7 @@ struct SettingsView: View {
                     Button("Lock vault now", systemImage: "lock.fill") {
                         model.lock()
                     }
+                    .foregroundStyle(.blue)
                     Button("Destroy vault", systemImage: "trash", role: .destructive) {
                         showDestroyConfirmation = true
                     }
