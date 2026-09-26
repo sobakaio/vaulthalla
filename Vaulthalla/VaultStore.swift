@@ -306,7 +306,7 @@ actor VaultStore {
 
     func storageStatistics(using rootKey: SymmetricKey) async throws -> StorageStatistics {
         let header = try loadHeader()
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         let index = await blockStore.snapshot()
         let segmentCount = await blockStore.segmentCount()
         return StorageStatistics(
@@ -334,7 +334,7 @@ actor VaultStore {
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
         let type = url.pathExtension.lowercased()
         let mime = type == "jpg" || type == "jpeg" ? "image/jpeg" : type == "png" ? "image/png" : type == "gif" ? "image/gif" : type == "mp4" ? "video/mp4" : type == "mov" ? "video/quicktime" : type == "m4v" ? "video/x-m4v" : "application/octet-stream"
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.importFile(at: url, filename: url.lastPathComponent, mimeType: mime, rootKey: rootKey, segmentCapacity: header.segmentCapacity)
     }
 
@@ -345,7 +345,7 @@ actor VaultStore {
         rootKey: SymmetricKey
     ) async throws -> MediaRecord? {
         let header = try loadHeader()
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.importStream(
             stream,
             filename: filename,
@@ -356,7 +356,7 @@ actor VaultStore {
     }
 
     func loadIndex(using rootKey: SymmetricKey) async throws {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
     }
 
     func indexSnapshot() async -> VaultIndex {
@@ -385,7 +385,7 @@ actor VaultStore {
 
     func readAudit(using rootKey: SymmetricKey) async throws -> [AuditEvent] {
         try await completeAuditRotation(using: rootKey)
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         let privateKey = try await requireMatchingAuditKey()
         let header = try loadHeader()
         let audit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
@@ -396,7 +396,7 @@ actor VaultStore {
     /// near-correct password or PIN. All old events are intentionally lost.
     func purgeLegacyAuditSecrets(using rootKey: SymmetricKey) async throws {
         try await completeAuditRotation(using: rootKey)
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         if (await blockStore.snapshot()).auditPrivacyVersion != 1 {
             try await eraseAudit(using: rootKey)
             // Commit the marker only after the old audit key and log are rotated.
@@ -429,7 +429,7 @@ actor VaultStore {
 
     func eraseAudit(using rootKey: SymmetricKey) async throws {
         try await completeAuditRotation(using: rootKey)
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         let header = try loadHeader()
         let audit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
 
@@ -516,7 +516,7 @@ actor VaultStore {
             throw VaultError.integrityFailure
         }
         let header = try loadHeader()
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         let oldAudit = try AuditLogStore(rootDirectory: rootDirectory, publicKeyData: header.auditPublicKey)
         try oldAudit.erase()
         if header.auditPublicKey != rotation.publicKey {
@@ -572,39 +572,45 @@ actor VaultStore {
 
     /// Returns the full authenticated plaintext of a media record.
     func readMedia(_ record: MediaRecord, using rootKey: SymmetricKey) async throws -> Data {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.plaintext(for: record)
     }
 
     func attachThumbnail(_ jpeg: Data, to record: MediaRecord, using rootKey: SymmetricKey) async throws {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         try await blockStore.attachThumbnail(jpeg, for: record)
         try await blockStore.save(using: rootKey)
     }
 
     func thumbnail(for record: MediaRecord, using rootKey: SymmetricKey) async throws -> Data? {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.thumbnailData(for: record)
     }
 
     func readMedia(_ record: MediaRecord, range: Range<Int64>, using rootKey: SymmetricKey) async throws -> Data {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.plaintext(for: record, byteRange: range)
     }
 
     func deleteMedia(_ id: UUID, using rootKey: SymmetricKey) async throws {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         try await blockStore.delete(id, rootKey: rootKey)
+    }
+
+    /// Batch delete with one durable index write for the whole selection.
+    func deleteMany(_ ids: [UUID], using rootKey: SymmetricKey) async throws {
+        try await blockStore.loadIfNeeded(using: rootKey)
+        try await blockStore.deleteMany(ids, rootKey: rootKey)
     }
 
     func compact(using rootKey: SymmetricKey) async throws -> Int {
         let header = try loadHeader()
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         return try await blockStore.compact(using: rootKey, segmentCapacity: header.segmentCapacity)
     }
 
     func verify(using rootKey: SymmetricKey) async throws -> (checked: Int, corrupt: [UUID]) {
-        try await blockStore.load(using: rootKey)
+        try await blockStore.loadIfNeeded(using: rootKey)
         let result = try await blockStore.verifyAll()
         try await blockStore.save(using: rootKey)
         return result

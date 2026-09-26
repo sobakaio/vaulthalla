@@ -225,6 +225,21 @@ final class VaultAppModel {
         return gen && ph && act && tc && di
     }
     private var generatedPreviewIDs = Set<UUID>()
+    // §7 — in-memory preview JPEGs. Grid tiles and viewer posters ask for
+    // the same record repeatedly; serving them from memory instead of the
+    // encrypted store keeps scrolling and video open-off cheap.
+    @ObservationIgnored private var previewCache: [UUID: Data] = [:]
+    @ObservationIgnored private var previewCacheBytes = 0
+    private static let previewCacheLimit = 32 * 1_048_576
+
+    private func cachePreview(_ data: Data, for id: UUID) {
+        previewCache[id] = data
+        previewCacheBytes += data.count
+        if previewCacheBytes > Self.previewCacheLimit {
+            previewCache.removeAll()
+            previewCacheBytes = 0
+        }
+    }
 
     /// §20 — free space on the volume holding the vault, in bytes.
     private func availableDiskSpace() -> Int64 {
@@ -1092,6 +1107,7 @@ final class VaultAppModel {
     /// §6 — returns encrypted previews, repairing legacy and streamed imports on demand.
     func preview(for record: MediaRecord) async -> Data? {
         guard let rootKey else { return nil }
+        if let cached = previewCache[record.id] { return cached }
         let isVideo = record.mimeType.hasPrefix("video/")
         let isImage = record.mimeType.hasPrefix("image/")
         guard isVideo || isImage else { return nil }
@@ -1103,8 +1119,10 @@ final class VaultAppModel {
                let full = try? await store.readMedia(record, using: rootKey),
                let upgraded = await ThumbnailGenerator.fromImageData(full) {
                 try? await store.attachThumbnail(upgraded, to: record, using: rootKey)
+                cachePreview(upgraded, for: record.id)
                 return upgraded
             }
+            cachePreview(thumb, for: record.id)
             return thumb
         }
 
@@ -1128,6 +1146,7 @@ final class VaultAppModel {
             // Keep this in memory for the current view, but leave the repair
             // action available in Settings if encrypted persistence failed.
         }
+        cachePreview(jpeg, for: record.id)
         return jpeg
     }
 
@@ -1193,8 +1212,11 @@ final class VaultAppModel {
         guard let rootKey else { return }
         isBusy = true
         defer { isBusy = false }
+        try? await store.deleteMany(Array(ids), using: rootKey)
         for id in ids {
-            try? await store.deleteMedia(id, using: rootKey)
+            if let dropped = previewCache.removeValue(forKey: id) {
+                previewCacheBytes -= dropped.count
+            }
         }
         await refreshIndex()
     }
@@ -1669,6 +1691,8 @@ final class VaultAppModel {
         records = []
         auditEvents = []
         generatedPreviewIDs.removeAll()
+        previewCache.removeAll()
+        previewCacheBytes = 0
         // An onboarding flow has no vault to protect. Keep it visible when the
         // app is backgrounded or privacy protection is triggered before the
         // first vault has been created. Cold-boot loading is the same: the
@@ -1697,6 +1721,8 @@ final class VaultAppModel {
         records = []
         auditEvents = []
         generatedPreviewIDs.removeAll()
+        previewCache.removeAll()
+        previewCacheBytes = 0
         // A restart must finish cleanup even if deletion was interrupted.
         UserDefaults.standard.set(true, forKey: "vaultDestructionPending")
         do {
@@ -2322,8 +2348,10 @@ struct GroupTileView: View {
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .task(id: cover?.id) {
             guard let cover else { return }
-            if let data = await model.preview(for: cover) {
-                image = UIImage(data: data)
+            let data = await model.preview(for: cover)
+            let decoded = await vaultDecodeImage(data)
+            if !Task.isCancelled {
+                image = decoded
             }
         }
     }
@@ -3011,8 +3039,11 @@ struct MediaTile: View {
             )
         }
         .task {
-            if let data = await model.preview(for: record) {
-                image = UIImage(data: data)
+            guard image == nil else { return }
+            let data = await model.preview(for: record)
+            let decoded = await vaultDecodeImage(data)
+            if !Task.isCancelled, let decoded {
+                image = decoded
             }
         }
         .accessibilityLabel(record.filename)
@@ -4067,9 +4098,11 @@ private struct ViewerVideoPoster: View {
         }
         .task(id: record.id) {
             guard image == nil,
-                  let data = await model.preview(for: record),
-                  let decoded = UIImage(data: data) else { return }
-            image = decoded
+                  let data = await model.preview(for: record) else { return }
+            let decoded = await vaultDecodeImage(data)
+            if !Task.isCancelled {
+                image = decoded
+            }
         }
     }
 }
@@ -4113,15 +4146,21 @@ private struct ViewerImagePage: View {
         .task(id: "\(record.id)-\(isCurrent)") {
             if isCurrent {
                 if image == nil {
-                    if let data = await model.read(record), let img = UIImage(data: data) {
-                        image = img
-                        warmImage = nil
-                        onCurrentImageLoaded?(img)
+                    if let data = await model.read(record) {
+                        let img = await vaultDecodeImage(data)
+                        if !Task.isCancelled, let img {
+                            image = img
+                            warmImage = nil
+                            onCurrentImageLoaded?(img)
+                        }
                     }
                 }
             } else if image == nil, warmImage == nil {
-                if let data = await model.preview(for: record), let img = UIImage(data: data) {
-                    warmImage = img
+                if let data = await model.preview(for: record) {
+                    let img = await vaultDecodeImage(data)
+                    if !Task.isCancelled {
+                        warmImage = img
+                    }
                 }
             }
         }
@@ -4153,6 +4192,16 @@ private func vaultCoverScale(for image: UIImage, in container: CGSize) -> CGFloa
     let fit = min(container.width / iw, container.height / ih)
     let cover = max(container.width / iw, container.height / ih)
     return cover / fit
+}
+
+/// Decodes preview or full JPEG bytes off the main thread. Grid tiles and
+/// viewer pages used to decode inside their `.task` on the main actor, which
+/// stalled scroll frames while a row of thumbnails appeared.
+nonisolated func vaultDecodeImage(_ data: Data?) async -> UIImage? {
+    guard let data else { return nil }
+    return await Task.detached(priority: .userInitiated) {
+        UIImage(data: data)
+    }.value
 }
 
 struct VaultVideoView: View {

@@ -228,6 +228,10 @@ final class VaultVideoPlayerModel {
         stop()
         self.provider = provider
         let item = AVPlayerItem(asset: asset)
+        // Keep four seconds of headroom: range serving is fast but not free,
+        // and a deeper forward buffer absorbs decode bursts without a
+        // visible mid-playback stall.
+        item.preferredForwardBufferDuration = 4
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,

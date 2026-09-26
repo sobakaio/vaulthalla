@@ -20,15 +20,22 @@ actor EncryptedBlockStore {
     private(set) var index = VaultIndex()
     private var accessGeneration: UInt64 = 0
     private var accessRevoked = false
+    /// Access generation for which the index was last read from disk. Inside
+    /// one generation the index is only mutated within this actor (every
+    /// mutation persists it), so the in-memory copy never goes stale.
+    private var indexLoadedAtGeneration: UInt64?
 
     func revokeAccess() {
         accessGeneration &+= 1
         accessRevoked = true
+        indexLoadedAtGeneration = nil
+        purgeChunkCache()
     }
 
     func activateAccess() {
         accessGeneration &+= 1
         accessRevoked = false
+        indexLoadedAtGeneration = nil
     }
 
     private var indexURL: URL { rootDirectory.appendingPathComponent("index.v1") }
@@ -79,6 +86,18 @@ actor EncryptedBlockStore {
         } catch VaultError.integrityFailure {
             throw VaultError.authenticatedIndexMismatch
         }
+    }
+
+    /// Loads the authenticated index from disk unless it was already loaded
+    /// for the current access generation. The expensive disk read, AES-GCM
+    /// open and JSON decode then happen once per unlock instead of on every
+    /// media read, range read and thumbnail fetch.
+    func loadIfNeeded(using rootKey: SymmetricKey) throws {
+        if !accessRevoked, let loaded = indexLoadedAtGeneration, loaded == accessGeneration {
+            return
+        }
+        try load(using: rootKey)
+        indexLoadedAtGeneration = accessGeneration
     }
 
     func save(using rootKey: SymmetricKey) throws {
@@ -333,6 +352,64 @@ actor EncryptedBlockStore {
         return ChunkAddress(segment: segment, slot: slot)
     }
 
+    // §7 — decrypted-chunk cache. Video range serving and probes re-request
+    // overlapping 1 MB chunks; caching plaintext turns repeat serving into a
+    // memory copy instead of disk read + HKDF + AES-GCM per request.
+    private struct ChunkKey: Hashable {
+        let recordID: UUID
+        let ordinal: Int
+    }
+    private var chunkPlaintext: [ChunkKey: Data] = [:]
+    private var chunkPlaintextOrder: [ChunkKey] = []
+    private var chunkPlaintextBytes = 0
+    private static let chunkCacheLimit = 64 * 1_048_576
+
+    private func purgeChunkCache() {
+        chunkPlaintext.removeAll()
+        chunkPlaintextOrder.removeAll()
+        chunkPlaintextBytes = 0
+    }
+
+    private func cacheChunk(_ data: Data, recordID: UUID, ordinal: Int) {
+        let key = ChunkKey(recordID: recordID, ordinal: ordinal)
+        chunkPlaintext[key] = data
+        chunkPlaintextOrder.append(key)
+        chunkPlaintextBytes += data.count
+        while chunkPlaintextBytes > Self.chunkCacheLimit, let oldest = chunkPlaintextOrder.first {
+            chunkPlaintextOrder.removeFirst()
+            if let evicted = chunkPlaintext.removeValue(forKey: oldest) {
+                chunkPlaintextBytes -= evicted.count
+            }
+        }
+    }
+
+    /// Decrypted payload of one chunk, served from the cache when possible.
+    private func decryptedChunk(for record: MediaRecord, ordinal: Int) throws -> Data {
+        let key = ChunkKey(recordID: record.id, ordinal: ordinal)
+        if let cached = chunkPlaintext[key] { return cached }
+        let address = record.chunks[ordinal]
+        let physical = try readEncryptedChunk(at: address)
+        let nonce = try AES.GCM.Nonce(data: physical.prefix(12))
+        let chunkKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: record.mediaKey),
+            salt: Data("Vaulthalla-media-salt-v1".utf8),
+            info: Data("item:\(record.id.uuidString)|chunk:\(ordinal)|format:1".utf8),
+            outputByteCount: 32
+        )
+        let box = try AES.GCM.SealedBox(
+            nonce: nonce,
+            ciphertext: physical.dropFirst(12).dropLast(16),
+            tag: physical.suffix(16)
+        )
+        let clear = try AES.GCM.open(
+            box,
+            using: chunkKey,
+            authenticating: Data("Vaulthalla-chunk-v1|\(address.segment)|\(address.slot)".utf8)
+        )
+        cacheChunk(clear, recordID: record.id, ordinal: ordinal)
+        return clear
+    }
+
     /// Writes authenticated plaintext to a complete-protection temporary file
     /// without buffering an entire large media item in memory. The caller must
     /// remove the file as soon as it has finished deriving its preview.
@@ -412,25 +489,7 @@ actor EncryptedBlockStore {
         let lastChunk = Int((byteRange.upperBound - 1) / Int64(VaultConstants.chunkPayloadSize))
         var result = Data()
         for ordinal in firstChunk...lastChunk {
-            let address = record.chunks[ordinal]
-            let physical = try readEncryptedChunk(at: address)
-            let nonce = try AES.GCM.Nonce(data: physical.prefix(12))
-            let chunkKey = HKDF<SHA256>.deriveKey(
-                inputKeyMaterial: SymmetricKey(data: record.mediaKey),
-                salt: Data("Vaulthalla-media-salt-v1".utf8),
-                info: Data("item:\(record.id.uuidString)|chunk:\(ordinal)|format:1".utf8),
-                outputByteCount: 32
-            )
-            let box = try AES.GCM.SealedBox(
-                nonce: nonce,
-                ciphertext: physical.dropFirst(12).dropLast(16),
-                tag: physical.suffix(16)
-            )
-            let clear = try AES.GCM.open(
-                box,
-                using: chunkKey,
-                authenticating: Data("Vaulthalla-chunk-v1|\(address.segment)|\(address.slot)".utf8)
-            )
+            let clear = try decryptedChunk(for: record, ordinal: ordinal)
             let chunkStart = Int64(ordinal * VaultConstants.chunkPayloadSize)
             let lower = max(byteRange.lowerBound, chunkStart) - chunkStart
             let upper = min(byteRange.upperBound, chunkStart + Int64(clear.count)) - chunkStart
@@ -442,21 +501,8 @@ actor EncryptedBlockStore {
     func plaintext(for record: MediaRecord) throws -> Data {
         var plaintext = Data()
         plaintext.reserveCapacity(Int(record.byteCount))
-        for (ordinal, address) in record.chunks.enumerated() {
-            let physical = try readEncryptedChunk(at: address)
-            guard physical.count == slotSize else { throw VaultError.integrityFailure }
-            let nonce = try AES.GCM.Nonce(data: physical.prefix(12))
-            let ciphertext = physical.dropFirst(12).dropLast(16)
-            let tag = physical.suffix(16)
-            let chunkKey = HKDF<SHA256>.deriveKey(
-                inputKeyMaterial: SymmetricKey(data: record.mediaKey),
-                salt: Data("Vaulthalla-media-salt-v1".utf8),
-                info: Data("item:\(record.id.uuidString)|chunk:\(ordinal)|format:1".utf8),
-                outputByteCount: 32
-            )
-            let aad = Data("Vaulthalla-chunk-v1|\(address.segment)|\(address.slot)".utf8)
-            let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
-            plaintext.append(try AES.GCM.open(box, using: chunkKey, authenticating: aad))
+        for (ordinal, _) in record.chunks.enumerated() {
+            plaintext.append(try decryptedChunk(for: record, ordinal: ordinal))
         }
         guard plaintext.count >= record.byteCount else { throw VaultError.integrityFailure }
         plaintext.removeSubrange(Int(record.byteCount)..<plaintext.count)
@@ -542,7 +588,23 @@ actor EncryptedBlockStore {
     func delete(_ id: UUID, rootKey: SymmetricKey) throws {
         guard let record = index.records.removeValue(forKey: id) else { return }
         record.chunks.forEach { index.freeChunks.insert($0) }
+        purgeChunkCache()
         try save(using: rootKey)
+    }
+
+    /// Removes a batch of records with a single durable index write —
+    /// bulk deletes from a large selection must not rewrite (and sync) the
+    /// whole index once per record.
+    func deleteMany(_ ids: [UUID], rootKey: SymmetricKey) throws {
+        guard !ids.isEmpty else { return }
+        var changed = false
+        for id in ids {
+            guard let record = index.records.removeValue(forKey: id) else { continue }
+            record.chunks.forEach { index.freeChunks.insert($0) }
+            changed = true
+        }
+        purgeChunkCache()
+        if changed { try save(using: rootKey) }
     }
 
     func snapshot() -> VaultIndex { index }
