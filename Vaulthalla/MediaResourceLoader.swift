@@ -192,6 +192,10 @@ final class VaultVideoPlayerModel {
     /// issue range reads.
     @ObservationIgnored private var provider: VaultVideoAssetProvider?
     @ObservationIgnored var onFinished: (() -> Void)?
+    /// Live loop preference read by the end-of-time observer at fire time.
+    /// The view resets it each time a video (re)starts, so a video prepared
+    /// before a slideshow started still advances it instead of looping.
+    @ObservationIgnored var loops = false
 
     /// Streams the video through an in-memory resource loader and plays it.
     /// Decrypted bytes exist only in memory; nothing is written to disk.
@@ -232,19 +236,25 @@ final class VaultVideoPlayerModel {
         // and a deeper forward buffer absorbs decode bursts without a
         // visible mid-playback stall.
         item.preferredForwardBufferDuration = 4
+        // Default from the prepare-time preference; the view overrides this
+        // right before each (re)start so the flag is never stale.
+        self.loops = loops
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            if loops {
-                Task { @MainActor in
+            // Read the live loop preference (not the prepare-time value): the
+            // view flips it right before each (re)start, e.g. when a slideshow
+            // starts on an already-open video.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.loops {
                     await self.player?.seek(to: .zero)
                     self.player?.play()
+                } else {
+                    self.onFinished?()
                 }
-            } else {
-                self.onFinished?()
             }
         }
         player = AVPlayer(playerItem: item)

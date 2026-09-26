@@ -3232,6 +3232,7 @@ struct MediaViewer: View {
                 return
             }
             playback.player?.isMuted = isMuted
+            playback.loops = videoLoop && !slideshowActive
             startVideoTasks(autoplay: videoAutoplay)
         }
         .onAppear {
@@ -3746,6 +3747,7 @@ struct MediaViewer: View {
             }
             playerModel.onFinished = { if slideshowActive { advanceSlideshow() } }
             playerModel.player?.isMuted = isMuted
+            playerModel.loops = videoLoop && !slideshowActive
             startVideoTasks(autoplay: videoAutoplay)
             videoTransitionTask = nil
         }
