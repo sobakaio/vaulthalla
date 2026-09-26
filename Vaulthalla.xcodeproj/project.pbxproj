@@ -37,20 +37,6 @@
 			);
 			target = 66243CBA305AEC6B00ACEC93 /* Vaulthalla */;
 		};
-		66C6E5DC3064131D004B4E19 /* Exceptions for "VaulthallaTests" folder in "VaulthallaTests" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				VaulthallaUITests.swift,
-			);
-			target = 66243CC7305AEC6C00ACEC93 /* VaulthallaTests */;
-		};
-		66C6E5DD3064131D004B4E19 /* Exceptions for "VaulthallaTests" folder in "VaulthallaUITests" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				VaulthallaUITests.swift,
-			);
-			target = 66243CD1305AEC6C00ACEC93 /* VaulthallaUITests */;
-		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -64,10 +50,6 @@
 		};
 		66243CCB305AEC6C00ACEC93 /* VaulthallaTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				66C6E5DC3064131D004B4E19 /* Exceptions for "VaulthallaTests" folder in "VaulthallaTests" target */,
-				66C6E5DD3064131D004B4E19 /* Exceptions for "VaulthallaTests" folder in "VaulthallaUITests" target */,
-			);
 			path = VaulthallaTests;
 			sourceTree = "<group>";
 		};
