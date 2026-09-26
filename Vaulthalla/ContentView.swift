@@ -4300,7 +4300,7 @@ struct SettingsView: View {
             Form {
                 Section {
                     Toggle("Screenshot protection", isOn: $screenshotProtection)
-                    Text("Vaulthalla covers sensitive screens when the app leaves the foreground, locks the vault in the background, and — when screenshot protection is on — covers the screen and locks on screenshots or screen recordings.")
+                    Text("Vaulthalla covers sensitive screens when the app leaves the foreground and locks the vault in the background. Screenshot protection cannot block the capture itself — iOS does not let apps prevent screenshots — but a screenshot or screen recording is detected immediately: the screen is covered and the vault locks, so any further captures only show the black cover.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } header: {

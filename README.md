@@ -128,7 +128,7 @@ Current vault, audit, and app-managed staging files are marked to be excluded fr
 
 Deleting an item removes its active key from the current encrypted index and removes it from the vault state. Vaulthalla does not claim guaranteed physical overwrite of historical bytes, snapshots, or backups.
 
-Video playback can create a full decrypted copy in a temporary file marked `NSFileProtectionComplete`. The app removes it when playback ends and sweeps leftovers on a later launch after a crash; physical erasure is not guaranteed.
+Video playback never writes decrypted media to disk: the player streams decrypted byte ranges through an in-memory resource loader. On launch the app sweeps plaintext temporary files left behind by previous app versions that decrypted to disk; physical erasure of such legacy files is not guaranteed.
 
 The USB/Finder inbox is an intentional plaintext staging area until the user imports or removes its files. Photos and Files imports may ask Apple’s system pickers to retrieve media the user explicitly selects, including from iCloud-backed libraries or drives. Those system-managed transfers are separate from Vaulthalla’s normal local-only vault behavior.
 
