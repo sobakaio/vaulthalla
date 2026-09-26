@@ -275,7 +275,10 @@ enum AntiDebug {
         var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.size
-        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return false }
+        // Fail closed: if the query itself fails, treat the debugger as
+        // present. A hooked sysctl that returns an error must not be able to
+        // silence this check.
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return true }
         // P_TRACED (0x1) from <mach/proc.h>
         return (info.kp_proc.p_flag & 0x1) != 0
         #endif

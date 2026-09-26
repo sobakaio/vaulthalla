@@ -45,11 +45,19 @@ struct ContentView: View {
                 model.lock()
             } else if phase == .active {
                 privacyCover = false
-                // A system permission prompt (or backgrounding) briefly
-                // transitions the scene to .inactive, which stopped the
-                // import server. If the import sheet is still on screen,
-                // resume the session instead of leaving it permanently off.
-                model.webImportResumeIfSheetVisible()
+                // Re-check for a debugger whenever the app becomes foreground
+                // again: one attached while the app was hidden must not let an
+                // unlocked vault keep living in RAM. Detection locks; it never
+                // destroys — destructive paths stay user-controlled.
+                if AntiDebug.isDebuggerAttached() {
+                    model.lock(reason: "debugger detected")
+                } else {
+                    // A system permission prompt (or backgrounding) briefly
+                    // transitions the scene to .inactive, which stopped the
+                    // import server. If the import sheet is still on screen,
+                    // resume the session instead of leaving it permanently off.
+                    model.webImportResumeIfSheetVisible()
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
