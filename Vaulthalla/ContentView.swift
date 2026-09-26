@@ -7,7 +7,9 @@ import Photos
 import UIKit
 import LocalAuthentication
 import AVKit
+#if DEBUG
 import OSLog
+#endif
 import Security
 import UserNotifications
 
@@ -143,7 +145,9 @@ final class VaultAppModel {
     var faceIDFailureThreshold = 3
     var storageStatistics: VaultStore.StorageStatistics?
 
+    #if DEBUG
     private static let logger = Logger(subsystem: "io.sobaka.vaulthalla", category: "vault-lifecycle")
+    #endif
     /// Injectable for tests (§42); production always uses the shared stores.
     var store: VaultStore = .shared
     /// Keychain scope of this model's vault. Tests inject an isolated
@@ -208,12 +212,17 @@ final class VaultAppModel {
         isApplicationActive() && !Task.isCancelled && !destructionInProgress
     }
 
+    #if DEBUG
     /// Diagnostic (TODO #1): log to BOTH os_log and stdout (devicectl --console).
+    /// Compiled into DEBUG builds only; every call site is likewise gated,
+    /// so Release binaries carry no diagnostic logging or its strings.
     func fdTrace(_ message: String) {
         print("FDTRACE " + message)
         Self.logger.info("\(message, privacy: .public)")
     }
+    #endif
 
+    #if DEBUG
     /// Diagnostic (TODO #1): log exactly which gate condition blocks an unlock.
     private func fdGate(_ tag: String, generation: UInt64) -> Bool {
         let gen = sessionGeneration == generation
@@ -224,6 +233,7 @@ final class VaultAppModel {
         fdTrace("FD-GATE \(tag) pass=\(gen && ph && act && tc && di) generationMatch=\(gen) [now=\(sessionGeneration) then=\(generation)] phaseLocked=\(ph) appActive=\(act) taskCancelled=\(!tc) destructionInProgress=\(di) appState=\(String(describing: UIApplication.shared.applicationState))")
         return gen && ph && act && tc && di
     }
+    #endif
     private var generatedPreviewIDs = Set<UUID>()
     // §7 — in-memory preview JPEGs. Grid tiles and viewer posters ask for
     // the same record repeatedly; serving them from memory instead of the
@@ -489,16 +499,22 @@ final class VaultAppModel {
         }
         isBusy = true
         defer { isBusy = false }
+        #if DEBUG
         Self.logger.info("Vault creation started")
+        #endif
         do {
             try await store.createVault(password: pendingPassword, segmentCapacity: selectedSegment)
             let unlockedKey = try await store.unlock(password: pendingPassword)
             pendingPassword = ""
             confirmPassword = ""
             await finishUnlock(using: unlockedKey)
+            #if DEBUG
             Self.logger.info("Vault creation completed")
+            #endif
         } catch {
+            #if DEBUG
             Self.logger.error("Vault creation failed")
+            #endif
             errorMessage = error.localizedDescription
         }
     }
@@ -728,11 +744,16 @@ final class VaultAppModel {
         // the first index load after a background lock fails and PIN/Face ID
         // look broken ("Vault Integrity Error" / endless Face ID loop).
         await store.activateAccess()
+        #if DEBUG
         fdTrace("FD-2 finishUnlock: activateAccess done, appState=\(String(describing: UIApplication.shared.applicationState))")
+        #endif
         let generation = sessionGeneration
         let initialPhase = phase
         rootKey = key
-        guard await refreshIndex() else { fdTrace("FD-3 refreshIndex FAILED errorMessage=\(errorMessage)"); 
+        guard await refreshIndex() else {
+            #if DEBUG
+            fdTrace("FD-3 refreshIndex FAILED errorMessage=\(errorMessage)")
+            #endif
             if phase != .onboarding {
                 rootKey = nil
                 records = []
@@ -760,14 +781,18 @@ final class VaultAppModel {
         }
         guard !destructionInProgress, rootKey != nil, sessionGeneration == generation,
               phase == initialPhase, isApplicationActive() else {
+            #if DEBUG
             fdTrace("FD-4 finishUnlock FINAL GUARD FAILED: destructionInProgress=\(destructionInProgress) rootKeyNil=\(rootKey == nil) genMatch=\(sessionGeneration == generation) [now=\(sessionGeneration) then=\(generation)] phaseMatch=\(phase == initialPhase) appActive=\(isApplicationActive()) appState=\(String(describing: UIApplication.shared.applicationState))")
+            #endif
             if sessionGeneration == generation {
                 rootKey = nil
                 records = []
             }
             return
         }
+        #if DEBUG
         fdTrace("FD-5 UNLOCKED phase -> unlocked")
+        #endif
         phase = .unlocked
         // Let the library become visible before resuming any long-running import.
         Task { await resumePendingPhotoImport() }
@@ -1305,15 +1330,36 @@ final class VaultAppModel {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
         do {
             let unlockedKey = try ConvenienceUnlockStore.unlockWithPIN(pendingPIN)
+            #if DEBUG
             fdTrace("PIN-1 PIN auth OK, key received")
-            guard canFinishUnlock(generation) else { fdTrace("PIN-1b blocked by canFinishUnlock after auth"); return }
-            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .pin) else { fdTrace("PIN-1c recordSuccessChecked FAILED"); errorMessage = "Security state unavailable. Unlock blocked."; return }
+            #endif
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("PIN-1b blocked by canFinishUnlock after auth")
+                #endif
+                return
+            }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .pin) else {
+                #if DEBUG
+                fdTrace("PIN-1c recordSuccessChecked FAILED")
+                #endif
+                errorMessage = "Security state unavailable. Unlock blocked."; return
+            }
+            #if DEBUG
             fdTrace("PIN-1d recordSuccessChecked OK")
+            #endif
             unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .pin, result: "success", enteredSecret: nil))
             pendingPIN = ""
-            guard canFinishUnlock(generation) else { fdTrace("PIN-1e blocked by canFinishUnlock before finishUnlock"); return }
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("PIN-1e blocked by canFinishUnlock before finishUnlock")
+                #endif
+                return
+            }
+            #if DEBUG
             fdTrace("PIN-1f entering finishUnlock (PIN)")
+            #endif
             await finishUnlock(using: unlockedKey)
         } catch {
             guard canFinishUnlock(generation) else { return }
@@ -1366,14 +1412,35 @@ final class VaultAppModel {
         defer { isBusy = false }
         do {
             let unlockedKey = try await faceIDUnlocker.unlock()
+            #if DEBUG
             fdTrace("FD-1 faceID auth OK, key received")
-            guard canFinishUnlock(generation) else { fdTrace("FD-1b blocked by canFinishUnlock after auth"); return }
-            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .faceID) else { fdTrace("FD-1c recordSuccessChecked FAILED"); errorMessage = "Security state unavailable. Unlock blocked."; return }
+            #endif
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("FD-1b blocked by canFinishUnlock after auth")
+                #endif
+                return
+            }
+            guard let persisted = try? await attemptStore.recordSuccessChecked(method: .faceID) else {
+                #if DEBUG
+                fdTrace("FD-1c recordSuccessChecked FAILED")
+                #endif
+                errorMessage = "Security state unavailable. Unlock blocked."; return
+            }
+            #if DEBUG
             fdTrace("FD-1d recordSuccessChecked OK")
+            #endif
             unlockStatistics = persisted
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "success", enteredSecret: nil))
-            guard canFinishUnlock(generation) else { fdTrace("FD-1e blocked by canFinishUnlock before finishUnlock"); return }
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("FD-1e blocked by canFinishUnlock before finishUnlock")
+                #endif
+                return
+            }
+            #if DEBUG
             fdTrace("FD-1f entering finishUnlock (faceID)")
+            #endif
             await finishUnlock(using: unlockedKey)
         } catch is FaceIDAuthenticationFailure {
             guard canFinishUnlock(generation) else { return }
@@ -1395,22 +1462,44 @@ final class VaultAppModel {
             // Biometrics matched but the stored wrapper no longer does: the
             // enrollment changed, so this wrapper is dead. Disable it instead
             // of looping the user through prompts that can never succeed.
+            #if DEBUG
             fdTrace("FD-6 FaceIDWrapperUnavailableFailure (green check but wrapper unreadable)")
-            guard canFinishUnlock(generation) else { fdTrace("FD-6b silent: generation mismatch on wrapper-unavailable"); return }
+            #endif
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("FD-6b silent: generation mismatch on wrapper-unavailable")
+                #endif
+                return
+            }
             faceIDEnabled = false
             await store.appendAudit(AuditEvent(timestamp: Date(), method: .faceID, result: "wrapper-unavailable", enteredSecret: nil))
             errorMessage = "Face ID unlock is no longer available — your biometric enrollment changed. Unlock with your password and re-enable Face ID in settings."
         } catch is FaceIDUnavailableFailure {
+            #if DEBUG
             fdTrace("FD-7 FaceIDUnavailableFailure (no sensor / cancelled / not configured)")
-            guard canFinishUnlock(generation) else { fdTrace("FD-7b silent: generation mismatch"); return }
+            #endif
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("FD-7b silent: generation mismatch")
+                #endif
+                return
+            }
             errorMessage = "Face ID is unavailable right now. Try again, or unlock with your password."
         } catch {
+            #if DEBUG
             fdTrace("FD-8 unexpected error: \(error)")
-            guard canFinishUnlock(generation) else { fdTrace("FD-8b silent: generation mismatch"); return }
+            #endif
+            guard canFinishUnlock(generation) else {
+                #if DEBUG
+                fdTrace("FD-8b silent: generation mismatch")
+                #endif
+                return
+            }
             errorMessage = "Face ID unlock failed. Try again, or unlock with your password."
         }
     }
 
+    #if DEBUG
     /// TODO #1 diagnostic: with the launch arguments
     /// `-vaulthallaAutoFaceID 1` (and optionally `-vaulthallaAutoCreate 1`),
     /// drive the Face ID unlock automatically once the app reaches the locked
@@ -1473,7 +1562,9 @@ final class VaultAppModel {
             try? await Task.sleep(for: .milliseconds(250))
         }
     }
+    #endif
 
+    #if DEBUG
     func autoFaceIDUnlockForDiagnostics() async {
         guard ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoFaceID") else { return }
         fdTrace("FD-0 auto FaceID diagnostic armed autoCreate=\(ProcessInfo.processInfo.arguments.contains("-vaulthallaAutoCreate"))")
@@ -1513,6 +1604,7 @@ final class VaultAppModel {
         }
         fdTrace("FD-0c diagnostic timed out")
     }
+    #endif
 
     func loadSecuritySettings() async {
         guard let state = try? await attemptStore.loadChecked() else { errorMessage = "Security state unavailable. Unlock blocked."; return }
