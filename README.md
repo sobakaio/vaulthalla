@@ -63,6 +63,7 @@ Vaulthalla’s primary unlock binds the master password to the original device. 
 | **Independent media keys** | Every imported item has its own random 256-bit key. |
 | **Minimal lock-screen leakage** | Vault contents, counts, storage, groups, and activity stay hidden until unlock. |
 | **One-way vault** | No export, sharing, Save to Photos, or Save to Files from the vault. |
+| **Debugger detection** | Unlock (password, PIN, Face ID) is refused while a debugger is attached; detection fails closed and re-checks on every foreground return, locking the vault with an audit record. |
 | **Integrity response** | Chunk verification reports corruption without silently repairing media. Confirmed, unrecoverable vault/key mismatch triggers resumable destruction; transient I/O or Keychain errors block access without wiping. |
 
 ### Device-bound encryption
@@ -96,6 +97,7 @@ Vaulthalla’s primary unlock binds the master password to the original device. 
 - An optional auto-destroy policy can destroy vault keys and remove the vault after a configured number of failed password attempts.
 - The app locks when it leaves the foreground. Optional screenshot and screen-recording protection obscures the interface and can lock on capture detection; it cannot guarantee prevention of OS or external-camera captures.
 - An opaque privacy cover protects the App Switcher preview.
+- A debugger-attached process can never unlock the vault: detection blocks password, PIN, and Face ID unlock, fails closed when the process query errors, and is re-checked every time the app returns to the foreground (a detection locks the vault with an audit record). Detection is defense-in-depth against a compromised device, not a claim of tamper-proofness.
 - Security Activity is optional and **off by default**. When enabled, its encrypted history is visible only after unlock and records time, unlock method, and result—not entered passwords or PINs. Turning it off clears the current history and rotates its key.
 
 ## Local Web Import
